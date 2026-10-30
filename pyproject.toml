@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pii-pipeline"
+version = "0.1.0"
+description = "PII masking: Presidio analyzer + anonymizer, with a swappable NER recognizer and deterministic rules"
+requires-python = ">=3.10"
+dependencies = [
+    "presidio-analyzer",
+    "presidio-anonymizer",
+    "pyyaml",
+    "transformers==5.18.0",
+    "torch",
+    "fastapi",
+    "uvicorn",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "httpx"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

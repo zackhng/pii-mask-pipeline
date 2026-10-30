@@ -1,0 +1,86 @@
+# PII masking pipeline configuration.
+# Paths are relative to the directory you run the command from.
+#
+# Two parts:
+#   TEMPLATE  generic pipeline behaviour. Same for every domain.
+#   DOMAIN    what to detect for one domain: the NER model, table fields, deny lists, patterns,
+#             and the separator rule. Replace this whole part to adapt the pipeline to another domain.
+
+# =====================================================================================
+# TEMPLATE
+# =====================================================================================
+
+languages: [en, zh, ja, ko, hi, ar, th, vi, ms, id, tl]
+default_language: en
+
+# Never masked, matched exactly against the detected text.
+allow_list: ["Our Firm Pte Ltd"]
+
+# Overlapping spans are merged into one span covering their union. The merged label comes from the
+# best member, by this source order, then score, then longer span. Must be a permutation of
+# [deny_list, table_columns, table_rows, patterns, ner].
+priority: [deny_list, table_columns, table_rows, patterns, ner]
+
+masking:
+  # original:  one placeholder per value; variants of a value share it (not a 1:1 map back).  [PERSON_01]
+  # versioned: one placeholder per exact surface form; each maps back to exactly one original. [PERSON_01.2]
+  mode: original
+  format: "[{entity}_{index:02d}]"   # versioned mode needs {version}, e.g. "[{entity}_{index:02d}.{version}]"
+  per_entity: {}                     # e.g. {DOB: {operator: redact}} for Presidio's built-in operators
+
+# =====================================================================================
+# DOMAIN: wealth management
+# =====================================================================================
+
+# Swappable NER recognizer. `class` is 'package.module:ClassName'; `params` are passed to its constructor.
+ner:
+  class: pii_pipeline.recognizers.ner_hf:HFTokenClassRecognizer
+  params:
+    model_dir: models/xlmr-base-pii-ml-v5.0
+    device: auto            # auto | cuda | cpu
+    max_length: 384
+    stride: 96
+    # trim_punct: omitted -> read from the model's config.json (true for v5.0)
+  label_map: {}             # e.g. {BUSINESS: ORGANIZATION}
+  min_score: 0.0
+
+# Labels whose values differ only by separators: "123-456 789" and "123456789" are the same value.
+# Only affects masking indices, not detection.
+separator_insensitive: [ACCOUNT, PHONE, TIN]
+
+# Exact values -> entity (score 1.0). Matching is case-insensitive unless case_sensitive: true.
+deny_list:
+  - {entity: BUSINESS, values: ["Acme Wealth Pte Ltd"]}
+  - {entity: PERSON, values: ["Jane Doe"], case_sensitive: true}
+
+# Markdown tables. A cell is labelled by its column header (cells below it) or its row header
+# (the other cells in its row). Aliases match exactly after normalising case, spacing and * _ ` : emphasis.
+# Header cells and row-header cells are never masked themselves.
+tables:
+  score: 0.9
+  column_headers:           # header-row cell -> labels every non-empty cell below it
+    ACCOUNT: [account, account no, account no., account number, acct, a/c]
+    PHONE: [phone, tel, telephone, mobile]
+    DOB: [date of birth, dob, birth date]
+    PERSON: [client name, name, full name]
+  row_headers:              # first cell of a row -> labels the other non-empty cells in that row
+    PERSON: [client, client name, name, relationship manager]
+    ADDRESS: [address, residential address, registered address]
+    TIN: [tax id, tin, nric, passport no]
+
+# Regex -> entity.
+patterns:
+  - {name: sg_nric, entity: TIN, regex: '\b[STFG]\d{7}[A-Z]\b', score: 0.85}
+
+# Checks: a detected span is masked only if every check for its label passes. Rules fail open:
+# a value that cannot be parsed is still masked. Deny-list values are not checked.
+# No checks are enabled by default. Rules are functions you write in your own module, referenced as
+# "package.module:function". Each is called as fn(text, params, today) and returns True to keep the span.
+# Add them under `checks:`, one list per label, e.g.:
+#
+#   checks:
+#     DOB:
+#       - {rule: "myrules.dates:dob_adult", years: 18}
+#
+# The template ships no rules; this section is empty until you add some.
+checks: {}
