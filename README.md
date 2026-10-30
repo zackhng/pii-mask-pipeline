@@ -205,6 +205,19 @@ Full reference, with request and response examples, error codes, and offset rule
 
 The API has no authentication. Run it on a private network or behind a gateway.
 
+### Docker
+
+The image runs the API on CPU and does not contain the model weights. Mount `models/` at runtime:
+
+```bash
+docker build -t pii-mask-pipeline .
+docker run --rm -p 8000:8000 -v "$PWD/models:/app/models:ro" pii-mask-pipeline
+```
+
+The container runs as a non-root user and reports health at `/health`. It uses one worker, because
+each worker loads its own copy of the model. Pass a different config with `-e PII_CONFIG=/app/configs/<file>`
+after copying the file into the image, or by mounting it over `/app/configs`.
+
 ## Swapping the NER model
 
 - **Different weights, same architecture:** change `ner.params.model_dir`.

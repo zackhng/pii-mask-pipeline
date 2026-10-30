@@ -1,0 +1,14 @@
+# Keep the build context small and free of local state.
+.git
+.gitignore
+.venv
+models
+**/__pycache__
+**/*.pyc
+*.egg-info
+.pytest_cache
+tests
+docs
+*.zip
+Dockerfile
+.dockerignore
