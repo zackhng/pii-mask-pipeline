@@ -214,6 +214,9 @@ docker build -t pii-mask-pipeline .
 docker run --rm -p 8000:8000 -v "$PWD/models:/app/models:ro" pii-mask-pipeline
 ```
 
+On Windows with Git Bash, prefix the run command with `MSYS_NO_PATHCONV=1`. Otherwise Git Bash
+rewrites the container path in `-v` and the mount is missing.
+
 The container runs as a non-root user and reports health at `/health`. It uses one worker, because
 each worker loads its own copy of the model. Pass a different config with `-e PII_CONFIG=/app/configs/<file>`
 after copying the file into the image, or by mounting it over `/app/configs`.

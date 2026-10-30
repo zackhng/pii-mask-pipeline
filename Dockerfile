@@ -17,7 +17,7 @@ WORKDIR /app
 
 # CPU-only torch, pinned to the version the model was trained with. The CUDA wheel from PyPI would add
 # several GB. pyproject's unpinned "torch" is then already satisfied, so pip does not pull the CUDA build.
-RUN pip install --index-url https://download.pytorch.org/whl/cpu torch==2.8.0
+RUN pip install --extra-index-url https://download.pytorch.org/whl/cpu torch==2.8.0+cpu
 
 COPY pyproject.toml README.md ./
 COPY src ./src
