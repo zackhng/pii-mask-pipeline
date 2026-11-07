@@ -5,7 +5,8 @@ detect():
        built-ins, NER). The allow list is applied here.
     2. Span rules: each span must pass the rules for its label and the "*" rules. Deny-list values
        are not checked.
-    3. Context: a model or regex span that is a fragment of a longer ASCII word is rejected.
+    3. Context: a model or regex span that cuts an ASCII word is grown to the whole word when it covers
+       most of it (a boundary error), and rejected when it covers half or less ("Ann" in "Annual").
     4. Table and inline labels override model spans on the text they cover (semantic_values.py).
     5. Overlapping spans are merged into their union.
 mask():
@@ -17,6 +18,7 @@ from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
 
+from presidio_analyzer import RecognizerResult
 from presidio_anonymizer import AnonymizerEngine
 
 from .analyzer import build_analyzer, merge_overlaps, source_of
@@ -27,10 +29,11 @@ from .masking.anonymizer import PIIAnonymizer, span_from_result
 from .masking.optimized_anonymizer import OptimizedAnonymizer
 from .masking.semantic_values import apply_semantic_overrides
 from .masking.span_rules import Gate, make_rule
-from .nlp.context_enhancer import is_inside_ascii_word
+from .nlp.context_enhancer import expand_to_ascii_word, is_inside_ascii_word
 
 UNGATED_SOURCES = frozenset({"deny_list"})
 WORD_CHECKED_SOURCES = frozenset({"ner", "patterns", "presidio"})
+FRAGMENT_KEEP_RATIO = 0.5   # a word fragment covering more than this share of its word is grown, not rejected
 
 
 @dataclass
@@ -77,6 +80,36 @@ class PIIPipeline:
         cls = OptimizedAnonymizer if self.config.anonymizer.optimized else PIIAnonymizer
         return cls(self.engine, self.config.anonymizer)
 
+    @staticmethod
+    def _fix_word_fragment(text: str, r: RecognizerResult) -> tuple[RecognizerResult, str | None]:
+        """A span that cuts an ASCII word. If it covers more than half of the word(s), it is most likely
+        a boundary error ("Tan Wei Min" in "Tan Wei Ming", "12345678" in "acct12345678"): grow it to the
+        whole word so nothing leaks. Otherwise it is most likely a false match ("Ann" in "Annual"):
+        reject it."""
+        start, end = expand_to_ascii_word(text, r.start, r.end)
+        if (r.end - r.start) / (end - start) > FRAGMENT_KEEP_RATIO:
+            return RecognizerResult(r.entity_type, start, end, r.score,
+                                    recognition_metadata=r.recognition_metadata), None
+        return r, "context:inside_word"
+
+    @staticmethod
+    def _grow_separated_value(text: str, r: RecognizerResult) -> RecognizerResult:
+        """For separator-insensitive labels: a span that stops at '-' or '.' followed by more letters or
+        digits ("123-456" in "123-456-7") is grown over the rest of the value, so no part of it stays
+        visible. A trailing full stop followed by a space is left alone."""
+        start, end = r.start, r.end
+        while end + 1 < len(text) and text[end] in ".-" and text[end + 1].isalnum():
+            end += 1
+            while end < len(text) and text[end].isalnum():
+                end += 1
+        while start >= 2 and text[start - 1] in ".-" and text[start - 2].isalnum():
+            start -= 1
+            while start > 0 and text[start - 1].isalnum():
+                start -= 1
+        if (start, end) == (r.start, r.end):
+            return r
+        return RecognizerResult(r.entity_type, start, end, r.score, recognition_metadata=r.recognition_metadata)
+
     def detect(self, request: str | DetectionRequest, language: str | None = None) -> DetectionResult:
         """Detection only. Nothing is masked."""
         if isinstance(request, str):
@@ -91,6 +124,11 @@ class PIIPipeline:
                                     allow_list=self.config.anonymizer.allow_listed_values,
                                     allow_list_match="exact")
 
+        # labels outside included_entities go before merging, so they cannot swallow an included span
+        included = self.config.anonymizer.included_entities
+        if included is not None:
+            raw = [r for r in raw if r.entity_type in included]
+
         # rules run before merging, so a rejected span never masks text
         today = self.today or date.today()
         kept, rejected = [], []
@@ -100,7 +138,9 @@ class PIIPipeline:
             if source not in UNGATED_SOURCES:
                 rule = self.gate.rejected_by(r.entity_type, text[r.start:r.end], today)
             if rule is None and source in WORD_CHECKED_SOURCES and is_inside_ascii_word(text, r.start, r.end):
-                rule = "context:inside_word"
+                r, rule = self._fix_word_fragment(text, r)
+            if rule is None and r.entity_type in self.config.anonymizer.separator_insensitive:
+                r = self._grow_separated_value(text, r)
             if rule:
                 rejected.append(rejected_dict(r, rule))
             else:

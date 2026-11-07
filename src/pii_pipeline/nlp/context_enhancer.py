@@ -1,18 +1,27 @@
 """Checks on the words around a span.
 
-is_inside_ascii_word   rejects a match that is a fragment of a longer ASCII word or identifier
+is_inside_ascii_word   True for a match that is a fragment of a longer ASCII word or identifier
                        ("Ann" inside "Annual", "nnual" inside "Annual report").
+expand_to_ascii_word   the span grown to the whole ASCII word(s) it cuts.
 has_label_in_window    True if one of the given label words occurs within `window` characters of the span.
 """
 from __future__ import annotations
 
 import re
 
-_WORD = re.compile(r"[^\W_]+(?:['’][^\W_]+)?", re.UNICODE)
-
 
 def _ascii_word_char(c: str) -> bool:
     return c.isascii() and (c.isalnum() or c == "_")
+
+
+def expand_to_ascii_word(text: str, start: int, end: int) -> tuple[int, int]:
+    """Grow the span over ASCII word characters on either side until it covers whole words."""
+    if start < end:
+        while start > 0 and _ascii_word_char(text[start - 1]) and _ascii_word_char(text[start]):
+            start -= 1
+        while end < len(text) and _ascii_word_char(text[end]) and _ascii_word_char(text[end - 1]):
+            end += 1
+    return start, end
 
 
 def is_inside_ascii_word(text: str, start: int, end: int) -> bool:

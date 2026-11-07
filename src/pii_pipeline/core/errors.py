@@ -43,6 +43,12 @@ class TextTooLargeError(PIIError):
     status_code = 413
 
 
+class InvalidTextError(PIIError):
+    """The text cannot be processed, e.g. it contains a lone UTF-16 surrogate."""
+    code = "invalid_text"
+    status_code = 422
+
+
 class UnsupportedLanguageError(PIIError):
     code = "unsupported_language"
     status_code = 422

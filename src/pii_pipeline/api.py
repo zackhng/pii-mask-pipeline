@@ -21,7 +21,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-from .core.errors import PIIError, TextTooLargeError, UnsupportedLanguageError
+from .core.errors import InvalidTextError, PIIError, TextTooLargeError, UnsupportedLanguageError
 from .pipeline import PIIPipeline, entity_dict
 
 DEFAULT_MAX_CHARS = 200_000
@@ -96,6 +96,10 @@ def create_app(config_path: str | None = None, max_text_chars: int | None = None
     def check_request(body: TextIn) -> None:
         if len(body.text) > max_chars:
             raise TextTooLargeError(f"text is {len(body.text)} characters; limit is {max_chars}")
+        try:
+            body.text.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            raise InvalidTextError(f"text has an invalid character (lone surrogate) at offset {exc.start}") from None
         if body.language is not None and body.language not in pipeline().config.languages:
             raise UnsupportedLanguageError(f"language {body.language!r} is not configured; "
                                            f"available: {pipeline().config.languages}")

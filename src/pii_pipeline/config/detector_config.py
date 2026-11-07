@@ -13,6 +13,7 @@ All validation errors raise ConfigError (a ValueError) with a message starting "
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from importlib import resources
 from pathlib import Path
@@ -175,10 +176,45 @@ def _str_list(value, name: str) -> list[str]:
     return [str(v) for v in value]
 
 
+def _mapping(value, name: str) -> dict:
+    """`value` as a dict; None is an empty dict. Anything else is a ConfigError."""
+    if value is None:
+        return {}
+    _require(isinstance(value, dict), f"{name} must be a mapping, got {type(value).__name__}")
+    return value
+
+
+def _number(value, name: str, kind=float):
+    try:
+        return kind(value)
+    except (TypeError, ValueError):
+        raise ConfigError(f"{name} must be a number, got {value!r}") from None
+
+
 def _score(value, name: str, default: float) -> float:
-    score = float(default if value is None else value)
+    score = _number(default if value is None else value, name)
     _require(0.0 <= score <= 1.0, f"{name} must be in [0, 1]")
     return score
+
+
+def _check_regex(pattern: str, name: str) -> None:
+    try:
+        re.compile(pattern)
+    except re.error as exc:
+        raise ConfigError(f"{name}: invalid regex: {exc}") from exc
+
+
+def _check_operator(entity: str, spec: dict) -> None:
+    """Run the Presidio operator once on a sample, so unknown operators and bad params fail at load."""
+    from presidio_analyzer import RecognizerResult
+    from presidio_anonymizer import AnonymizerEngine
+    from presidio_anonymizer.entities import OperatorConfig
+    params = {k: v for k, v in spec.items() if k != "operator"}
+    try:
+        AnonymizerEngine().anonymize(text="sample", analyzer_results=[RecognizerResult(entity, 0, 6, 1.0)],
+                                     operators={entity: OperatorConfig(str(spec["operator"]), params)})
+    except Exception as exc:
+        raise ConfigError(f"anonymizer.per_entity.{entity}: {type(exc).__name__}: {exc}") from exc
 
 
 def _parse_patterns(items, where: str) -> list[PatternItem]:
@@ -196,8 +232,9 @@ def _parse_patterns(items, where: str) -> list[PatternItem]:
             name=str(item["name"]), entity=str(item["label"]), regex=str(item["pattern"]),
             score=_score(item.get("score"), f"{where} {item['name']} score", 0.5),
             context=_str_list(item.get("context"), f"{where} {item['name']} context"),
-            context_window=int(item.get("context_window", 40)),
+            context_window=_number(item.get("context_window", 40), f"{where} {item['name']} context_window", int),
         ))
+        _check_regex(out[-1].regex, f"{where} {item['name']}")
     return out
 
 
@@ -211,10 +248,11 @@ def _load_pattern_file(path: str, base_dir: Path | None) -> list[PatternItem]:
 
 
 def _parse_presidio(raw) -> PresidioConfig:
-    raw = raw or {}
+    raw = _mapping(raw, "presidio_recognizers")
     deny = []
     for item in raw.get("deny_list") or []:
-        values = item.get("values") or []
+        item = _mapping(item, "presidio_recognizers.deny_list entry")
+        values = _str_list(item.get("values"), "presidio_recognizers.deny_list values")
         _require("entity" in item, "presidio_recognizers.deny_list entries need an entity")
         _require(bool(values), f"presidio_recognizers.deny_list entry for {item.get('entity')} has no values")
         deny.append(DenyListItem(entity=str(item["entity"]), values=[str(v) for v in values],
@@ -225,8 +263,10 @@ def _parse_presidio(raw) -> PresidioConfig:
 def _parse_table_semantics(raw) -> TableSemantics | None:
     if not raw:
         return None
+    raw = _mapping(raw, "anonymizer.table_semantics")
 
     def fields(items, side):
+        _require(items is None or isinstance(items, list), f"table_semantics.{side} must be a list")
         out = []
         for i, item in enumerate(items or []):
             _require(isinstance(item, dict) and "entity_type" in item,
@@ -250,7 +290,8 @@ def _parse_table_semantics(raw) -> TableSemantics | None:
 
 def _parse_span_rules(raw) -> list[SpanRuleItem]:
     out = []
-    for entity, items in (raw or {}).items():
+    for entity, items in _mapping(raw, "anonymizer.span_rules").items():
+        _require(items is None or isinstance(items, list), f"span_rules.{entity} must be a list")
         for item in items or []:
             _require(isinstance(item, dict) and "rule" in item, f"span_rules.{entity} entry needs a rule name")
             params = {k: v for k, v in item.items() if k != "rule"}
@@ -273,7 +314,7 @@ def _parse_priority(raw) -> list[str]:
 
 
 def _parse_anonymizer(raw) -> AnonymizerConfig:
-    raw = raw or {}
+    raw = _mapping(raw, "anonymizer")
     mode = raw.get("mode", "original")
     _require(mode in MODES, f"anonymizer.mode must be one of {list(MODES)}")
     fmt = raw.get("format") or default_format(mode)
@@ -282,7 +323,7 @@ def _parse_anonymizer(raw) -> AnonymizerConfig:
     except ValueError as exc:
         raise ConfigError(f"anonymizer.format: {exc}") from exc
 
-    variant_rules = {str(k): _str_list(v, f"span_variant_rules.{k}") for k, v in (raw.get("span_variant_rules") or {}).items()}
+    variant_rules = {str(k): _str_list(v, f"span_variant_rules.{k}") for k, v in _mapping(raw.get("span_variant_rules"), "anonymizer.span_variant_rules").items()}
     from ..masking.span_variants import RULES
     for label, rules in variant_rules.items():
         bad = [r for r in rules if r not in RULES]
@@ -292,7 +333,7 @@ def _parse_anonymizer(raw) -> AnonymizerConfig:
     cfg = AnonymizerConfig(
         mode=mode,
         format=fmt,
-        per_entity=dict(raw.get("per_entity") or {}),
+        per_entity=dict(_mapping(raw.get("per_entity"), "anonymizer.per_entity")),
         priority=_parse_priority(raw.get("priority")),
         allow_listed_values=_str_list(raw.get("allow_listed_values"), "anonymizer.allow_listed_values"),
         entities_to_look_out_for=_str_list(raw.get("entities_to_look_out_for"), "anonymizer.entities_to_look_out_for"),
@@ -302,13 +343,14 @@ def _parse_anonymizer(raw) -> AnonymizerConfig:
         included_entities=None if included is None else _str_list(included, "anonymizer.included_entities"),
         optimized=bool(raw.get("optimized", False)),
         name_entities=_str_list(raw.get("name_entities", ["PERSON"]), "anonymizer.name_entities"),
-        span_alias={str(k): _str_list(v, f"span_alias.{k}") for k, v in (raw.get("span_alias") or {}).items()},
+        span_alias={str(k): _str_list(v, f"span_alias.{k}") for k, v in _mapping(raw.get("span_alias"), "anonymizer.span_alias").items()},
         inline_score=_score(raw.get("inline_score"), "anonymizer.inline_score", 0.9),
         table_semantics=_parse_table_semantics(raw.get("table_semantics")),
         span_rules=_parse_span_rules(raw.get("span_rules")),
     )
     for entity, spec in cfg.per_entity.items():
         _require(isinstance(spec, dict) and "operator" in spec, f"anonymizer.per_entity.{entity} needs an operator")
+        _check_operator(entity, spec)
     try:
         cfg.inline_aliases()
     except ValueError as exc:
@@ -318,9 +360,9 @@ def _parse_anonymizer(raw) -> AnonymizerConfig:
 
 def _parse_models(raw) -> dict[str, dict[str, Any]]:
     models: dict[str, dict[str, Any]] = {}
-    for section, entries in (raw or {}).items():
+    for section, entries in _mapping(raw, "model").items():
         _require(section in MODEL_SECTIONS, f"model.{section}: unknown section; use {list(MODEL_SECTIONS)}")
-        for name, entry in (entries or {}).items():
+        for name, entry in _mapping(entries, f"model.{section}").items():
             _require(isinstance(entry, dict), f"model.{section}.{name} must be a mapping")
             _require(name not in models, f"model name {name!r} is used twice")
             backend = entry.get("backend", MODEL_SECTIONS[section])
@@ -334,12 +376,12 @@ def _parse_ner(raw, models: dict[str, dict[str, Any]]) -> NerConfig | None:
         return None
     _require(isinstance(raw, dict), "ner must be a mapping")
     settings = dict(raw)
-    override = dict(settings.pop("params", None) or {})
-    label_map = dict(settings.pop("label_map", None) or {})
+    override = dict(_mapping(settings.pop("params", None), "ner.params"))
+    label_map = dict(_mapping(settings.pop("label_map", None), "ner.label_map"))
 
     if "class" in settings:   # inline custom recognizer: ner: {class: pkg.mod:Cls, params: {...}}
         return NerConfig(class_path=str(settings["class"]), params=override, label_map=label_map,
-                         min_score=float(settings.get("threshold", settings.get("min_score", 0.0))))
+                         min_score=_number(settings.get("threshold", settings.get("min_score", 0.0)), "ner.threshold"))
 
     name = settings.pop("model", None)
     _require(name is not None, "ner needs a model (a name under model.*) or a class")
@@ -351,7 +393,7 @@ def _parse_ner(raw, models: dict[str, dict[str, Any]]) -> NerConfig | None:
         _require("class" in entry, f"model.custom.{name} needs a class")
         return NerConfig(class_path=str(entry["class"]), params={**(entry.get("params") or {}), **override},
                          label_map=label_map, model=name, backend=backend,
-                         min_score=float(settings.get("threshold", 0.0)))
+                         min_score=_number(settings.get("threshold", 0.0), "ner.threshold"))
 
     required = "model_dir" if backend == "hf_bio" else "model"
     _require(required in entry, f"model {name!r} ({backend}) needs {required}")
@@ -359,6 +401,9 @@ def _parse_ner(raw, models: dict[str, dict[str, Any]]) -> NerConfig | None:
     params = {rename.get(k, k): v for k, v in entry.items()}
     params.update({rename.get(k, k): v for k, v in settings.items()})
     params.update(override)
+    for key in ("threshold", "min_score", "window_size", "max_length", "stride"):
+        if key in params:
+            params[key] = _number(params[key], f"ner {name} {key}", float if key in ("threshold", "min_score") else int)
     if label_map:
         params["label_map"] = label_map
     return NerConfig(class_path=BACKENDS[backend], params=params, model=name, backend=backend)

@@ -27,6 +27,7 @@ from presidio_anonymizer import AnonymizerEngine
 from presidio_anonymizer.entities import OperatorConfig
 
 from ..core.errors import ChecksumMismatchError
+from ..core.intervals import IntervalSet
 from ..core.types import DetectionResult, PIISpan, checksum_of
 from ..nlp.context_enhancer import is_inside_ascii_word
 from .span_variants import find_variants, identity_key, rules_for
@@ -140,13 +141,18 @@ class PIIAnonymizer:
             self._identity[key] = self._counters[span.entity_type]
         return self._identity[key]
 
-    @staticmethod
-    def _free(occupied: list[tuple[int, int]], start: int, end: int) -> bool:
-        return all(end <= s or start >= e for s, e in occupied)
+    def _propagation_rules(self, surface: str, entity: str) -> tuple[str, ...]:
+        """A single capitalised word ("Will", "May", "Bank") is searched with its exact case, so the
+        common lowercase word is not masked."""
+        rules = self.rules(entity)
+        word = surface.strip()
+        if word and not any(c.isspace() for c in word) and word[0].isupper() and not word.isupper():
+            rules = tuple(r for r in rules if r != "case")
+        return rules
 
     def _propagate(self, text: str, spans: list[PIISpan], urls) -> list[PIISpan]:
         """Other copies of values in `entities_to_look_out_for`."""
-        occupied = [(s.start, s.end) for s in spans]
+        occupied = IntervalSet((s.start, s.end) for s in spans)
         seen: set[tuple[str, str]] = set()
         added: list[PIISpan] = []
         sources = sorted((s for s in spans if s.entity_type in self.look_out_for),
@@ -155,15 +161,15 @@ class PIIAnonymizer:
             if (src.entity_type, src.text) in seen or len(src.text.strip()) < MIN_PROPAGATED_CHARS:
                 continue
             seen.add((src.entity_type, src.text))
-            for start, end in find_variants(text, src.text, self.rules(src.entity_type)):
-                if not self._free(occupied, start, end) or is_inside_ascii_word(text, start, end):
+            for start, end in find_variants(text, src.text, self._propagation_rules(src.text, src.entity_type)):
+                if not occupied.is_free(start, end) or is_inside_ascii_word(text, start, end):
                     continue
                 span = PIISpan(start=start, end=end, text=text[start:end], entity_type=src.entity_type,
                                score=src.score, recognizer_name=f"propagated:{src.recognizer_name}",
                                metadata={"identity": src.metadata["identity"]})
                 if not self._keep(span, urls):
                     continue
-                occupied.append((start, end))
+                occupied.add(start, end)
                 added.append(span)
         return added
 

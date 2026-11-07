@@ -15,6 +15,7 @@ and every "*" rule, returns True. Rules fail open: a value they cannot parse is 
 """
 from __future__ import annotations
 
+import logging
 import re
 from datetime import date
 from typing import Callable
@@ -22,6 +23,7 @@ from typing import Callable
 from ..registry import load_class
 
 Rule = Callable[[str, date], bool]
+log = logging.getLogger(__name__)
 ALL_LABELS = "*"
 
 _ISO_DATE = re.compile(r"\s*(\d{4})-(\d{1,2})-(\d{1,2})\s*")
@@ -115,6 +117,13 @@ def make_rule(name: str, params: dict) -> Rule:
                          f"or a 'package.module:function' path")
     if not callable(fn):
         raise ValueError(f"rule {name!r} is not callable")
+    if name in BUILTIN_RULES:
+        # built-in rules accept any text, so a failure on sample values means bad params
+        for sample in ("Tan Wei Ming", "2020-01-01", ""):
+            try:
+                fn(sample, params, date(2025, 1, 1))
+            except Exception as exc:
+                raise ValueError(f"bad params {params}: {type(exc).__name__}: {exc}") from exc
     return lambda text, today: bool(fn(text, params, today))
 
 
@@ -128,8 +137,15 @@ class Gate:
         return sum(len(v) for v in self.checks.values())
 
     def rejected_by(self, label: str, text: str, today: date) -> str | None:
-        """Name of the first failing rule, or None if the span passes every rule for its label."""
+        """Name of the first failing rule, or None if the span passes every rule for its label.
+        A rule that raises counts as passed (fail open: the span is still masked); the error is logged
+        without the text."""
         for name, rule in [*self.checks.get(ALL_LABELS, []), *self.checks.get(label, [])]:
-            if not rule(text, today):
+            try:
+                ok = rule(text, today)
+            except Exception as exc:
+                log.warning("span rule %s raised %s for a %s span; keeping the span", name, type(exc).__name__, label)
+                continue
+            if not ok:
                 return name
         return None

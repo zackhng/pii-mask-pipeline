@@ -73,8 +73,11 @@ you pass `--config` / set `PII_CONFIG`.
    list is applied here.
 2. **Span rules.** Each detection must pass the rules for its label and the `"*"` rules. Deny-list
    values are not checked. Refused detections are reported in `rejected`.
-3. **Context check.** A NER, regex or Presidio match that is a fragment of a longer ASCII word
-   ("Ann" in "Annual") is rejected as `context:inside_word`.
+3. **Context check.** A NER, regex or Presidio match that cuts an ASCII word is grown to the whole
+   word when it covers more than half of it, since that is usually a boundary error ("Tan Wei Min" in
+   "Tan Wei Ming", "12345678" in "acct12345678"). A smaller fragment ("Ann" in "Annual") is rejected
+   as `context:inside_word`. For `separator_insensitive` labels, a span that stops at `-` or `.`
+   inside a longer value ("123-456" in "123-456-7") is grown over the rest of it.
 4. **Structure overrides models.** Where a table cell or inline-label value overlaps a model span,
    the structured label wins on the text it covers (`masking/semantic_values.py`).
 5. **Overlap merging.** Overlapping spans merge into their union. The label comes from the best
@@ -176,8 +179,10 @@ after normalising case, spacing and `*` `_` `` ` `` `:` emphasis; substrings don
 **Repeated values.** For labels in `entities_to_look_out_for`, once a value is detected every other
 copy in the document is masked with the same identity, in any format its variant rules accept:
 `TAN WEI MING` for `Tan Wei Ming`, `123 456` for `123-456` (separator-insensitive labels), and
-e-mail addresses split across lines (`john.doe@exam⏎ple.com`). Copies inside a longer word and
-allow-listed values are skipped. These spans have source `propagated`.
+e-mail addresses split across lines (`john.doe@exam⏎ple.com`). Copies inside a longer word or a
+longer separated value (`123-456` in `123-456-7`) and allow-listed values are skipped. A single
+capitalised word (`Will`, `May`) is matched with its exact case, so the ordinary lowercase word is
+left alone. These spans have source `propagated`.
 
 **Name variants** (`optimized: true`). For each detected name (`name_entities`, default `[PERSON]`)
 the anonymizer also masks `Wei Ming`, `Tan`, `Mr Tan`, `W. M. Tan` and similar forms, with the full
@@ -207,7 +212,10 @@ Built-in rules (`masking/span_rules.py`): `min_length`, `max_length`, `has_digit
 dates and keep values they cannot parse.
 
 - A span is masked only if every rule for its label and every `"*"` rule returns `True`.
-- Rules are resolved when the config loads, so a bad name fails there.
+- Rules are resolved when the config loads, so a bad name fails there. Built-in rules are also run
+  once on sample values, so bad params (a missing `pattern`, `chars: two`) fail there too.
+- A rule that raises during a request counts as passed: the span is still masked, and a warning
+  (without the text) is logged.
 - A rejected detection is reported in `rejected` with its rule name and no text.
 - Deny-list values are not checked. Rules run before merging, so a rejected span never masks text.
 
@@ -331,11 +339,16 @@ Model-based tests skip when `models/` is missing. Most of the suite uses a fake 
   spans instead of merging with them.
 - **Inline values run to the end of the line** unless a `;`, `|` or another known label ends them.
   Keep `span_alias` to labels that introduce a single value.
+  Long values are masked whole. A value on the line after its label is not found.
 - **Name variants are for space-separated names.** Names written without spaces (Chinese, Japanese)
-  get no short forms. The neighbour guard is a heuristic: a capitalised word after a short form
-  blocks it, so `Tan Singapore` is left alone and a lowercase surname is never matched.
-- **Repeated-value masking is document-wide.** A short detected value (e.g. a two-letter name) in
-  `entities_to_look_out_for` is masked at every whole-word occurrence.
+  get no short forms, and lowercase particles (`bin`, `de`) are never forms on their own. The
+  neighbour guard is a heuristic: a capitalised word after a short form blocks it, and a short form
+  that starts a sentence is masked even when it is an ordinary word ("Mark the date" for Mark Tan).
+- **Repeated-value masking is document-wide.** A detected value in `entities_to_look_out_for` is
+  masked at every whole-word occurrence. A single-word name that is also a common word is still
+  masked at the start of a sentence ("May I help?" when "May" is a detected name).
+- **Exact table aliases.** A header like `Account No (SGD)` doesn't match the alias `account no`, and
+  placeholder cells such as `N/A` under a labelled column are masked too.
 - **Case-insensitive placeholders in original mode.** `Jane Doe` and `jane doe` share `[PERSON_01]`,
   and the mapping keeps the first original seen. Versioned mode keeps them apart.
 - **Masking mode is set in config only.** Requests cannot choose a mode per call.

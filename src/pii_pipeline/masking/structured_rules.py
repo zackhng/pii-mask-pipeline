@@ -18,11 +18,10 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 
-_SEP_CELL = re.compile(r"^:?-{3,}:?$")
+_SEP_CELL = re.compile(r"^:?-+:?$")   # GFM: one or more dashes
 _HEADER_STRIP = " \t*_`:："
 _VALUE_STRIP_LEAD = " \t*_`"
 _VALUE_STRIP_TAIL = " \t*_`,;.。，；"
-MAX_INLINE_VALUE = 160
 
 # ---------- markdown tables ----------
 
@@ -196,6 +195,6 @@ def inline_values(text: str, aliases: dict[str, str]) -> list[LabelledValue]:
                 s += 1
             while e > s and line[e - 1] in _VALUE_STRIP_TAIL:
                 e -= 1
-            if s < e and e - s <= MAX_INLINE_VALUE and not line[s:e].startswith("//"):
+            if s < e and not line[s:e].startswith("//"):
                 out.append(LabelledValue(label, line_start + s, line_start + e, "inline_labels"))
     return out

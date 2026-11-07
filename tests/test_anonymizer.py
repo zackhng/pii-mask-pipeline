@@ -60,12 +60,12 @@ def test_propagation_skips_word_fragments_and_excluded_values():
 # ---------- mappings ----------
 
 def test_mappings_returns_surfaces_and_filters_by_text():
-    text = "Bob and bob"
+    text = "Bob Lee and bob lee"
     a = anon(entities_to_look_out_for=["PERSON"])
-    a.anonymize(detect(text, {"Bob": "PERSON"}), text)
-    assert a.mappings() == {"Bob": "[PERSON_01]", "bob": "[PERSON_01]"}
-    assert a.mappings("only Bob here") == {"Bob": "[PERSON_01]"}
-    assert a.token_mapping() == {"[PERSON_01]": "Bob"}
+    a.anonymize(detect(text, {"Bob Lee": "PERSON"}), text)
+    assert a.mappings() == {"Bob Lee": "[PERSON_01]", "bob lee": "[PERSON_01]"}
+    assert a.mappings("only Bob Lee here") == {"Bob Lee": "[PERSON_01]"}
+    assert a.token_mapping() == {"[PERSON_01]": "Bob Lee"}
 
 
 def test_load_mappings_reuses_user_tokens_and_reserves_their_numbers():

@@ -74,9 +74,26 @@ def variant_pattern(surface: str, rules) -> re.Pattern | None:
     return re.compile("".join(parts), flags)
 
 
+def _continues(text: str, start: int, end: int) -> bool:
+    """True if the match is only part of a longer separated value: "123-456" inside "123-456-7" or
+    "0-123-456", or "123 456" inside "123 456 789"."""
+    after, before = text[end:end + 2], text[max(0, start - 2):start]
+    if re.match(r"[.\-]?\w", after) or re.search(r"\w[.\-]?$", before):
+        return True
+    if text[end - 1].isdigit() and re.match(r"[ \t]\d", after):
+        return True
+    if text[start].isdigit() and re.search(r"\d[ \t]$", before):
+        return True
+    return False
+
+
 def find_variants(text: str, surface: str, rules) -> list[tuple[int, int]]:
-    """(start, end) of every formatted copy of `surface` in `text`."""
+    """(start, end) of every formatted copy of `surface` in `text`. With the separators rule, a match
+    that is only part of a longer separated value is skipped."""
     pattern = variant_pattern(surface, rules)
     if pattern is None:
         return []
-    return [(m.start(), m.end()) for m in pattern.finditer(text) if m.end() > m.start()]
+    out = [(m.start(), m.end()) for m in pattern.finditer(text) if m.end() > m.start()]
+    if "separators" in rules:
+        out = [(s, e) for s, e in out if not _continues(text, s, e)]
+    return out

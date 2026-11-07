@@ -7,8 +7,9 @@ from typing import Any
 
 
 def checksum_of(text: str) -> str:
-    """sha256 of the text, used to check that a detection result is applied to the same text."""
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+    """sha256 of the text, used to check that a detection result is applied to the same text.
+    'surrogatepass' keeps lone surrogates (valid in JSON "\\ud800" escapes) from raising."""
+    return hashlib.sha256(text.encode("utf-8", "surrogatepass")).hexdigest()
 
 
 @dataclass

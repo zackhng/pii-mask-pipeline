@@ -150,7 +150,7 @@ A detection that a span rule or the context check refused. It was not masked and
 | `entity_type` | string | Label the detection had. |
 | `start`, `end` | integer | Offsets of the refused span. |
 | `source` | string | Recognizer that produced it. |
-| `rule` | string | The rule that refused it: a built-in name, a `package.module:function` path, or `context:inside_word` for a match inside a longer word. |
+| `rule` | string | The rule that refused it: a built-in name, a `package.module:function` path, or `context:inside_word` for a small fragment of a longer word. |
 
 Rejected entries contain no matched text. Deny-list values are never rejected.
 
@@ -174,6 +174,7 @@ FastAPI's standard `{"detail": [...]}` body.
 | Status | `code` | When | Example `detail` |
 |---|---|---|---|
 | `413` | `text_too_large` | `text` is longer than `PII_MAX_TEXT_CHARS` | `"text is 250000 characters; limit is 200000"` |
+| `422` | `invalid_text` | `text` contains a lone UTF-16 surrogate (a JSON `\ud800`-style escape) | `"text has an invalid character (lone surrogate) at offset 12"` |
 | `422` | `unsupported_language` | `language` is not configured | `"language 'fr' is not configured; available: ['en', ...]"` |
 | `422` | | Request body is malformed or a required field is missing | Pydantic's validation list |
 | `500` | | Unexpected server error | The request text is not included in logs or responses |
