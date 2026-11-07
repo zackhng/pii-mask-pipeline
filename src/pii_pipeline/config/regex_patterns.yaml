@@ -1,0 +1,28 @@
+# Regex detectors. You write the patterns; the pipeline only applies them.
+#
+# Each entry:
+#   label    entity type the match is masked as, e.g. EMAIL
+#   name     unique name, reported as the source "patterns:<name>"
+#   pattern  Python regular expression
+#   score    optional, 0..1, default 0.5. Used to pick a label when spans overlap.
+#   context  optional list of words; when set, a match is kept only if one of them appears within
+#            context_window characters (default 40) before or after it.
+#
+# Examples (remove the leading '#' to enable):
+#
+# - label: EMAIL
+#   name: email
+#   pattern: '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}'
+#   score: 0.9
+#
+# - label: TIN
+#   name: sg_nric
+#   pattern: '\b[STFGM]\d{7}[A-Z]\b'
+#   score: 0.85
+#
+# - label: PHONE
+#   name: sg_phone
+#   pattern: '(?:\+65[ -]?)?\b[689]\d{3}[ -]?\d{4}\b'
+#   score: 0.6
+#   context: [phone, tel, mobile, contact, hp]
+[]

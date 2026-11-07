@@ -1,53 +1,45 @@
-"""Table-field recognizer: labels the cell values of markdown tables by their column or row headers.
+"""Structured-label recognizers: Presidio wrappers around masking/structured_rules.py.
 
-mode "columns": a header-row cell matching a column alias labels every non-empty cell below it.
-mode "rows":    the first cell of a row matching a row alias labels the other non-empty cells in that row.
-Header cells and row-header cells are never labelled themselves.
+StructuredLabelRecognizer(mode="columns" | "rows")  table cells labelled by column or row headers
+StructuredLabelRecognizer(mode="inline")            values after "Label:" outside tables
 """
 from __future__ import annotations
 
 from presidio_analyzer import EntityRecognizer, RecognizerResult
 
-from ..tables import Cell, TableFields, find_tables, normalise_header
+from ..masking.structured_rules import TableFields, inline_values, table_values
+
+NAMES = {"columns": "table_columns", "rows": "table_rows", "inline": "inline_labels"}
 
 
-class TableFieldRecognizer(EntityRecognizer):
-    def __init__(self, fields: TableFields, mode: str, score: float = 0.9, supported_language: str = "en"):
-        if mode not in ("columns", "rows"):
-            raise ValueError(f"mode must be 'columns' or 'rows', got {mode!r}")
+class StructuredLabelRecognizer(EntityRecognizer):
+    def __init__(self, mode: str, score: float = 0.9, fields: TableFields | None = None,
+                 aliases: dict[str, str] | None = None, supported_language: str = "en"):
+        if mode not in NAMES:
+            raise ValueError(f"mode must be one of {list(NAMES)}, got {mode!r}")
         self.mode = mode
         self.score = score
-        self.fields = fields
-        aliases = self.fields.columns if mode == "columns" else self.fields.rows
-        super().__init__(supported_entities=sorted(set(aliases.values())),
-                         supported_language=supported_language, name=f"table_{mode}")
+        self.fields = fields or TableFields(columns={}, rows={})
+        self.aliases = dict(aliases or {})
+        labels = {"columns": self.fields.columns, "rows": self.fields.rows, "inline": self.aliases}[mode]
+        super().__init__(supported_entities=sorted(set(labels.values())),
+                         supported_language=supported_language, name=NAMES[mode])
 
     def load(self) -> None:
         self.is_loaded = True
 
     def analyze(self, text, entities, nlp_artifacts=None):
-        out: list[RecognizerResult] = []
-        for table in find_tables(text):
-            if self.mode == "columns":
-                labels = [self.fields.columns.get(normalise_header(c.text)) for c in table.header]
-                for row in table.rows:
-                    for j, label in enumerate(labels):
-                        if label and j < len(row):
-                            out.append(self._emit(label, row[j], entities))
-            else:
-                for row in table.rows:
-                    if not row:
-                        continue
-                    label = self.fields.rows.get(normalise_header(row[0].text))
-                    if label:
-                        for cell in row[1:]:
-                            out.append(self._emit(label, cell, entities))
-        return [r for r in out if r is not None]
+        if self.mode == "inline":
+            found = inline_values(text, self.aliases)
+        else:
+            found = table_values(text, self.fields, self.mode)
+        return [
+            RecognizerResult(entity_type=v.entity_type, start=v.start, end=v.end, score=self.score,
+                             recognition_metadata={RecognizerResult.RECOGNIZER_NAME_KEY: self.name})
+            for v in found if not entities or v.entity_type in entities
+        ]
 
-    def _emit(self, label: str, cell: Cell, entities):
-        if cell.end <= cell.start or (entities and label not in entities):
-            return None
-        return RecognizerResult(
-            entity_type=label, start=cell.start, end=cell.end, score=self.score,
-            recognition_metadata={RecognizerResult.RECOGNIZER_NAME_KEY: self.name},
-        )
+
+def TableFieldRecognizer(fields: TableFields, mode: str, score: float = 0.9, supported_language: str = "en"):
+    """Kept for callers of the old class: a structured recognizer for table columns or rows."""
+    return StructuredLabelRecognizer(mode, score=score, fields=fields, supported_language=supported_language)

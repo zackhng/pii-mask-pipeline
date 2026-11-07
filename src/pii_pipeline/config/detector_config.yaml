@@ -1,0 +1,139 @@
+# PII detector configuration. Relative paths are resolved from the directory you run the command in,
+# except regex_patterns_file, which is relative to this file.
+#
+# Sections:
+#   presidio_recognizers  Presidio's own recognizers and exact-value deny lists
+#   regex_patterns        regex detectors (regex_patterns.yaml)
+#   anonymizer            what is masked and how
+#   ner                   the NER model in use and its settings
+#   model                 every available model, written out in full
+
+languages: [en, zh, ja, ko, hi, ar, th, vi, ms, id, tl]
+default_language: en
+
+regex_patterns_file: regex_patterns.yaml
+
+# =====================================================================================
+# Presidio recognizers
+# =====================================================================================
+presidio_recognizers:
+  # Presidio's predefined recognizers, by class name. They run for every configured language.
+  builtin: []                                   # e.g. [EmailRecognizer, IbanRecognizer, CreditCardRecognizer]
+  # Exact values -> entity, score 1.0. Case-insensitive unless case_sensitive: true. Not checked by span_rules.
+  deny_list:
+    - {entity: BUSINESS, values: ["Acme Wealth Pte Ltd"]}
+    - {entity: PERSON, values: ["Jane Doe"], case_sensitive: true}
+
+# =====================================================================================
+# Anonymizer
+# =====================================================================================
+anonymizer:
+  # original:  one placeholder per value; variants of a value share it.        [PERSON_01]
+  # versioned: one placeholder per exact surface; maps back 1:1 to the text.   [PERSON_01_2]
+  mode: original
+  # format: "[{entity}_{index:02d}]"            # versioned needs {version}: "[{entity}_{index:02d}_{version}]"
+  per_entity: {}                                # e.g. {DOB: {operator: redact}} for Presidio's operators
+
+  # Overlapping spans merge into one; the label comes from the best member by this source order,
+  # then score, then length. Unlisted sources rank last.
+  priority: [deny_list, table_columns, table_rows, inline_labels, patterns, presidio, ner]
+
+  # Optional. Never masked, matched exactly against the detected text.
+  allow_listed_values: ["Our Firm Pte Ltd"]
+
+  # Once one of these is detected, every other occurrence of the same value in the document is masked
+  # too, including differently formatted copies (case, spacing, separators, line breaks).
+  entities_to_look_out_for: [PERSON, BUSINESS, EMAIL]
+
+  # Labels whose values differ only by separators: "123-456 789" == "123456789".
+  separator_insensitive: [ACCOUNT, PHONE, TIN]
+  # Per-label variant rules, overriding the defaults (case, whitespace; +separators / +linebreaks).
+  # span_variant_rules: {EMAIL: [case, linebreaks]}
+
+  # true leaves spans that sit inside a URL unmasked.
+  unmask_url: false
+
+  # Mask only these labels (null = all).
+  included_entities: null
+
+  # true: also find short forms of detected names ("Wei Ming", "Mr Tan", "W. M. Tan").
+  optimized: false
+
+  # Inline labels outside tables: "Client name: Tan Wei Ming", "- DOB: 1990-01-01".
+  span_alias:
+    PERSON: [client name, client, full name, relationship manager]
+    DOB: [date of birth, dob, birth date]
+    PHONE: [phone, tel, telephone, mobile]
+    ACCOUNT: [account no, account number, acct no]
+    TIN: [nric, tax id, tin, passport no]
+    ADDRESS: [address, residential address, registered address]
+    EMAIL: [email, e-mail]
+
+  # Markdown tables. A column header labels the cells below it; a row header (first cell) labels the
+  # other cells in its row. Header cells themselves are never masked. Table and inline labels override
+  # model detection on the text they cover.
+  table_semantics:
+    score: 0.9
+    columns:
+      - {name: account, entity_type: ACCOUNT, aliases: [account no, account no., account number, acct, a/c]}
+      - {name: phone, entity_type: PHONE, aliases: [tel, telephone, mobile]}
+      - {name: dob, entity_type: DOB, aliases: [date of birth, birth date]}
+      - {name: client name, entity_type: PERSON, aliases: [name, full name]}
+    rows:
+      - {name: client, entity_type: PERSON, aliases: [client name, name, relationship manager]}
+      - {name: address, entity_type: ADDRESS, aliases: [residential address, registered address]}
+      - {name: tin, entity_type: TIN, aliases: [tax id, nric, passport no]}
+
+  # A detected span is masked only if every rule for its label (and every "*" rule) passes.
+  # Rules are short names from masking/span_rules.py or "package.module:function" paths.
+  # Examples:
+  #   "*":  [{rule: min_length, chars: 2}]
+  #   DOB:  [{rule: dob_adult, years: 18}]
+  span_rules: {}
+
+# =====================================================================================
+# NER: the model in use. Settings here override the same keys in its model entry.
+#   window_size  tokens per window for token_classification; characters per window for gliner
+#   threshold    minimum span score
+# =====================================================================================
+ner:
+  model: xlmr_v5            # any name under model.*, e.g. gliner_multi_pii
+  device: auto              # auto | cuda | cpu
+  # window_size: 384
+  # stride: 96
+  # threshold: 0.0
+  label_map: {}             # e.g. {BUSINESS: ORGANIZATION}
+
+# =====================================================================================
+# Models
+# =====================================================================================
+model:
+  token_classification:     # BIO token-classification models (Hugging Face)
+    xlmr_v5:
+      model_dir: models/xlmr-base-pii-ml-v5.0
+      window_size: 384      # tokens
+      stride: 96
+      # trim_punct: omitted -> read from the model's config.json (true for v5.0)
+
+  gliner:                   # GLiNER models; needs `pip install .[gliner]`
+    gliner_multi_pii:
+      model: urchade/gliner_multi_pii-v1
+      window_size: 1500     # characters
+      stride: 200
+      threshold: 0.5
+      labels:               # GLiNER prompt label -> entity type
+        person: PERSON
+        organization: BUSINESS
+        phone number: PHONE
+        email: EMAIL
+        address: ADDRESS
+        date of birth: DOB
+        bank account number: ACCOUNT
+        passport number: TIN
+    gliner_small:
+      model: urchade/gliner_small-v2.1
+      threshold: 0.5
+      labels: {person: PERSON, organization: BUSINESS, address: ADDRESS}
+
+  # custom:                 # any Presidio EntityRecognizer
+  #   my_model: {class: "my_pkg.recognizers:MyRecognizer", params: {}}

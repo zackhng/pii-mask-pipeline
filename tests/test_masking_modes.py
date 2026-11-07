@@ -10,15 +10,12 @@ from pii_pipeline.pipeline import PIIPipeline
 
 
 def make(mode=None, phrases=None, separator_insensitive=None, fmt=None):
-    raw = {"languages": ["en"], "separator_insensitive": separator_insensitive or []}
-    masking = {}
+    anonymizer = {"separator_insensitive": separator_insensitive or []}
     if mode:
-        masking["mode"] = mode
+        anonymizer["mode"] = mode
     if fmt:
-        masking["format"] = fmt
-    if masking:
-        raw["masking"] = masking
-    cfg = parse_config(raw)
+        anonymizer["format"] = fmt
+    cfg = parse_config({"languages": ["en"], "anonymizer": anonymizer})
     cfg.ner = NerConfig(class_path="fake_ner:FakeNER", params={"phrases": phrases or {}})
     return PIIPipeline(cfg)
 
@@ -44,23 +41,23 @@ def test_original_mode_mapping_keeps_only_the_first_variant():
 
 def test_original_is_the_default_mode():
     cfg = parse_config({})
-    assert cfg.masking.mode == "original" and cfg.masking.format == "[{entity}_{index:02d}]"
+    assert cfg.anonymizer.mode == "original" and cfg.anonymizer.format == "[{entity}_{index:02d}]"
 
 
 # ---------- versioned mode ----------
 
 def test_versioned_mode_gives_each_exact_text_its_own_version():
     res = make("versioned", PHRASES).mask(TEXT, return_mapping=True)
-    assert res.text == ("[PERSON_01.1] met [PERSON_01.2], then [PERSON_01.1] ([PERSON_02.1]) called [PERSON_01.3].")
+    assert res.text == ("[PERSON_01_1] met [PERSON_01_2], then [PERSON_01_1] ([PERSON_02_1]) called [PERSON_01_3].")
 
 
 def test_versioned_mapping_is_one_to_one():
     res = make("versioned", PHRASES).mask(TEXT, return_mapping=True)
     assert res.mapping == {
-        "[PERSON_01.1]": "Tan Wei Ming",
-        "[PERSON_01.2]": "tan wei ming",
-        "[PERSON_01.3]": "TAN WEI MING",
-        "[PERSON_02.1]": "陈伟明",
+        "[PERSON_01_1]": "Tan Wei Ming",
+        "[PERSON_01_2]": "tan wei ming",
+        "[PERSON_01_3]": "TAN WEI MING",
+        "[PERSON_02_1]": "陈伟明",
     }
     assert len(set(res.mapping.values())) == len(res.mapping)
 
@@ -75,13 +72,13 @@ def test_versioned_separator_variants_share_an_index_with_separate_versions():
     phrases = {"123-456789-001": "ACCOUNT", "123456789001": "ACCOUNT"}
     res = make("versioned", phrases, separator_insensitive=["ACCOUNT"]).mask(
         "a 123-456789-001 b 123456789001", return_mapping=True)
-    assert res.text == "a [ACCOUNT_01.1] b [ACCOUNT_01.2]"
-    assert res.mapping == {"[ACCOUNT_01.1]": "123-456789-001", "[ACCOUNT_01.2]": "123456789001"}
+    assert res.text == "a [ACCOUNT_01_1] b [ACCOUNT_01_2]"
+    assert res.mapping == {"[ACCOUNT_01_1]": "123-456789-001", "[ACCOUNT_01_2]": "123456789001"}
 
 
 def test_versioned_default_format_has_the_version():
-    cfg = parse_config({"masking": {"mode": "versioned"}})
-    assert cfg.masking.format == "[{entity}_{index:02d}.{version}]"
+    cfg = parse_config({"anonymizer": {"mode": "versioned"}})
+    assert cfg.anonymizer.format == "[{entity}_{index:02d}_{version}]"
 
 
 def test_versioned_with_custom_format_keeps_version():
@@ -91,7 +88,7 @@ def test_versioned_with_custom_format_keeps_version():
 
 def test_entities_report_the_versioned_placeholder():
     res = make("versioned", PHRASES).mask("Tan Wei Ming and tan wei ming")
-    assert [e["placeholder"] for e in res.entities] == ["[PERSON_01.1]", "[PERSON_01.2]"]
+    assert [e["placeholder"] for e in res.entities] == ["[PERSON_01_1]", "[PERSON_01_2]"]
 
 
 def test_mapping_is_absent_unless_requested_in_both_modes():
@@ -114,20 +111,20 @@ def test_unmask_with_no_mapping_returns_input():
 # ---------- config validation ----------
 
 def test_invalid_mode_is_rejected():
-    with pytest.raises(ValueError, match="masking.mode"):
-        parse_config({"masking": {"mode": "reversible"}})
+    with pytest.raises(ValueError, match="anonymizer.mode"):
+        parse_config({"anonymizer": {"mode": "reversible"}})
 
 
 def test_versioned_format_without_version_is_rejected():
     with pytest.raises(ValueError, match="{version}"):
-        parse_config({"masking": {"mode": "versioned", "format": "[{entity}_{index:02d}]"}})
+        parse_config({"anonymizer": {"mode": "versioned", "format": "[{entity}_{index:02d}]"}})
 
 
 # ---------- API ----------
 
 CONFIG = """
 languages: [en]
-masking:
+anonymizer:
   mode: versioned
 ner:
   class: fake_ner:FakeNER
@@ -144,5 +141,5 @@ def test_api_reports_masking_mode_and_versioned_placeholders(tmp_path):
     with TestClient(create_app(config_path=str(path))) as client:
         assert client.get("/health").json()["masking_mode"] == "versioned"
         body = client.post("/mask", json={"text": "Tan Wei Ming, tan wei ming", "return_mapping": True}).json()
-        assert body["text"] == "[PERSON_01.1], [PERSON_01.2]"
-        assert body["mapping"] == {"[PERSON_01.1]": "Tan Wei Ming", "[PERSON_01.2]": "tan wei ming"}
+        assert body["text"] == "[PERSON_01_1], [PERSON_01_2]"
+        assert body["mapping"] == {"[PERSON_01_1]": "Tan Wei Ming", "[PERSON_01_2]": "tan wei ming"}
