@@ -18,10 +18,11 @@ ner:
       "Tan Wei Ming": PERSON
       "2020-05-01": DOB
       "123-456789-001": ACCOUNT
-allow_list: ["Our Firm Pte Ltd"]
-checks:
-  DOB:
-    - {rule: "check_rules:dob_adult", years: 18}
+anonymizer:
+  allow_listed_values: ["Our Firm Pte Ltd"]
+  span_rules:
+    DOB:
+      - {rule: "check_rules:dob_adult", years: 18}
 """
 
 

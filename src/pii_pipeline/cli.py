@@ -1,4 +1,4 @@
-"""python -m pii_pipeline.cli --config configs/pipeline.yaml (--text "..." | --file path) [--json] [--mapping]"""
+"""python -m pii_pipeline.cli [--config detector_config.yaml] (--text "..." | --file path) [--json] [--mapping]"""
 from __future__ import annotations
 
 import argparse
@@ -11,7 +11,7 @@ from .pipeline import PIIPipeline
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="pii-pipeline")
-    parser.add_argument("--config", required=True, type=Path)
+    parser.add_argument("--config", type=Path, default=None, help="detector config YAML (default: the packaged one)")
     src = parser.add_mutually_exclusive_group(required=True)
     src.add_argument("--text")
     src.add_argument("--file", type=Path)

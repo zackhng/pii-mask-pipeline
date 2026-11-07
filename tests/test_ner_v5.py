@@ -38,15 +38,16 @@ def test_deterministic_layer_on_top_of_ner(pipeline):
     # Deny list and NER run together in one analyzer: the deny-list value is masked even when the model misses it.
     from pii_pipeline.analyzer import build_analyzer
     from pii_pipeline.config import DenyListItem
-    original = list(pipeline.config.deny_list)
-    pipeline.config.deny_list = original + [DenyListItem(entity="BUSINESS", values=["Zebra Quartz Holdings"])]
+    deny = pipeline.config.presidio_recognizers
+    original = list(deny.deny_list)
+    deny.deny_list = original + [DenyListItem(entity="BUSINESS", values=["Zebra Quartz Holdings"])]
     pipeline.analyzer = build_analyzer(pipeline.config)
     try:
         out = pipeline.mask("Funds from Zebra Quartz Holdings were sent to Tan Wei Ming.").text
         assert "Zebra Quartz Holdings" not in out
         assert "Tan Wei Ming" not in out
     finally:
-        pipeline.config.deny_list = original
+        deny.deny_list = original
         pipeline.analyzer = build_analyzer(pipeline.config)
 
 

@@ -3,15 +3,15 @@
 #   docker build -t pii-mask-pipeline .
 #   docker run --rm -p 8000:8000 -v "$PWD/models:/app/models:ro" pii-mask-pipeline
 #
-# models/ must contain the v5.0 release (see README "Quick start"). The config's model_dir points
-# at /app/models/xlmr-base-pii-ml-v5.0.
+# models/ must contain the v5.0 release (see README "Quick start"). The packaged config's model_dir
+# (models/xlmr-base-pii-ml-v5.0) resolves to /app/models/xlmr-base-pii-ml-v5.0.
+# To use another config, mount it and pass -e PII_CONFIG=/path/to/detector_config.yaml.
 
 FROM python:3.10-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1 \
-    PII_CONFIG=/app/configs/pipeline.yaml
+    PIP_NO_CACHE_DIR=1
 
 WORKDIR /app
 
@@ -21,7 +21,6 @@ RUN pip install --extra-index-url https://download.pytorch.org/whl/cpu torch==2.
 
 COPY pyproject.toml README.md ./
 COPY src ./src
-COPY configs ./configs
 RUN pip install .
 
 # Run as an unprivileged user. models/ is created here so a mount has a target.

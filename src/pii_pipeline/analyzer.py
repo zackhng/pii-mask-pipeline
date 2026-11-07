@@ -1,4 +1,4 @@
-"""Presidio AnalyzerEngine assembled from the pipeline config."""
+"""Presidio AnalyzerEngine assembled from the detector config."""
 from __future__ import annotations
 
 import copy
@@ -6,15 +6,15 @@ import copy
 from presidio_analyzer import AnalyzerEngine, RecognizerRegistry, RecognizerResult
 from presidio_analyzer.nlp_engine import NoOpNlpEngine
 
-from .config import PipelineConfig
-from .recognizers.deterministic import deny_list_recognizers, pattern_recognizers
-from .recognizers.table import TableFieldRecognizer
+from .config.detector_config import DetectorConfig
+from .core.errors import ConfigError, ModelNotAvailableError, PIIError
+from .recognizers.deterministic import deny_list_recognizers, pattern_recognizers, presidio_builtin_recognizers
+from .recognizers.table import StructuredLabelRecognizer
 from .registry import load_class
-from .tables import load_table_fields, table_fields_from_sections
 
 
 def source_of(result: RecognizerResult) -> str:
-    """'deny_list' | 'patterns' | 'ner', from the recognizer name prefix."""
+    """The detector family, from the recognizer name prefix: 'deny_list', 'patterns', 'ner', ..."""
     name = (result.recognition_metadata or {}).get(RecognizerResult.RECOGNIZER_NAME_KEY, "")
     return name.split(":", 1)[0]
 
@@ -60,36 +60,53 @@ def merge_overlaps(results: list[RecognizerResult], priority: list[str]) -> list
     return merged
 
 
-def _ner_recognizers(cfg: PipelineConfig) -> list:
+def build_ner(cfg: DetectorConfig) -> list:
+    """The configured NER recognizer, or nothing. Load failures raise ModelNotAvailableError."""
     if cfg.ner is None:
         return []
-    cls = load_class(cfg.ner.class_path)
-    params = dict(cfg.ner.params)
-    # label_map / min_score are forwarded only when set, so a custom NER class need not accept them
-    if cfg.ner.label_map:
-        params.setdefault("label_map", cfg.ner.label_map)
-    if cfg.ner.min_score:
-        params.setdefault("min_score", cfg.ner.min_score)
-    recognizer = cls(**params)
+    ner = cfg.ner
+    try:
+        cls = load_class(ner.class_path)
+    except (ImportError, AttributeError) as exc:
+        raise ConfigError(f"ner class {ner.class_path!r} cannot be imported: {exc}") from exc
+    params = dict(ner.params)
+    # for custom classes label_map / min_score are forwarded only when set, so a class need not accept them
+    if ner.label_map:
+        params.setdefault("label_map", ner.label_map)
+    if ner.min_score:
+        params.setdefault("min_score", ner.min_score)
+    try:
+        recognizer = cls(**params)
+    except PIIError:
+        raise
+    except TypeError as exc:
+        raise ConfigError(f"ner {ner.display_name}: bad settings: {exc}") from exc
+    except (OSError, ImportError) as exc:
+        raise ModelNotAvailableError(f"ner {ner.display_name} could not be loaded: {exc}") from exc
     recognizer.name = f"ner:{recognizer.name}"
     return [recognizer]
 
 
-def _table_recognizers(cfg: PipelineConfig) -> list:
-    if cfg.tables is None:
-        return []
-    t = cfg.tables
-    fields = (load_table_fields(t.fields_file) if t.fields_file
-              else table_fields_from_sections(t.column_headers, t.row_headers))
-    return [TableFieldRecognizer(fields, mode=mode, score=t.score) for mode in ("columns", "rows")]
+def _structured_recognizers(cfg: DetectorConfig) -> list:
+    a = cfg.anonymizer
+    out = []
+    if a.table_semantics is not None:
+        fields = a.table_semantics.fields()
+        out += [StructuredLabelRecognizer(mode, score=a.table_semantics.score, fields=fields)
+                for mode in ("columns", "rows")]
+    aliases = a.inline_aliases()
+    if aliases:
+        out.append(StructuredLabelRecognizer("inline", score=a.inline_score, aliases=aliases))
+    return out
 
 
-def build_analyzer(cfg: PipelineConfig) -> AnalyzerEngine:
+def build_analyzer(cfg: DetectorConfig) -> AnalyzerEngine:
     base = [
-        *deny_list_recognizers(cfg.deny_list),
-        *_table_recognizers(cfg),
+        *deny_list_recognizers(cfg.presidio_recognizers.deny_list),
+        *_structured_recognizers(cfg),
         *pattern_recognizers(cfg.patterns),
-        *_ner_recognizers(cfg),
+        *presidio_builtin_recognizers(cfg.presidio_recognizers.builtin),
+        *build_ner(cfg),
     ]
     registry = RecognizerRegistry(supported_languages=cfg.languages)
     for lang in cfg.languages:

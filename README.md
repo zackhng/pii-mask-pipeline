@@ -1,17 +1,17 @@
 # pii-pipeline
 
 PII detection and masking built on [Microsoft Presidio](https://microsoft.github.io/presidio/).
-A swappable NER model and deterministic rules are Presidio recognizers. Presidio's `AnalyzerEngine`
-finds the spans, a checks gate and merge step clean them up, and `AnonymizerEngine` replaces them
-with indexed placeholders:
+Every detector is a Presidio recognizer: a NER model (BIO token classification or GLiNER), regex
+patterns, deny lists, Presidio's own recognizers, and labels taken from document structure (tables,
+`Label: value` lines). Span rules and context checks clean the detections up, and the anonymizer
+replaces them with indexed placeholders:
 
 ```
 Hi Tan Wei Ming (陈伟明), account 123-456789-001  ->  Hi [PERSON_01] ([PERSON_02]), account [ACCOUNT_01]
 ```
 
-The pipeline is a template. The generic behaviour (merging, masking, the API) is the same for
-every domain. What gets detected for a domain comes from a NER model plus the domain section of the
-config. The HTTP API is documented in [docs/API.md](docs/API.md).
+The pipeline is model-agnostic: the NER model is chosen by name in the config. The HTTP API is
+documented in [docs/API.md](docs/API.md).
 
 ## Contents
 
@@ -19,11 +19,13 @@ config. The HTTP API is documented in [docs/API.md](docs/API.md).
 - [How it works](#how-it-works)
 - [Configuration](#configuration)
 - [Masking modes](#masking-modes)
-- [Markdown tables](#markdown-tables)
-- [Checks](#checks)
+- [Structured labels: tables and inline labels](#structured-labels-tables-and-inline-labels)
+- [Repeated values and name variants](#repeated-values-and-name-variants)
+- [Span rules](#span-rules)
+- [NER models: BIO and GLiNER](#ner-models-bio-and-gliner)
+- [Python API](#python-api)
 - [Command line](#command-line)
 - [HTTP API](#http-api)
-- [Swapping the NER model](#swapping-the-ner-model)
 - [Tests](#tests)
 - [Known limitations](#known-limitations)
 - [Project layout](#project-layout)
@@ -36,11 +38,12 @@ config. The HTTP API is documented in [docs/API.md](docs/API.md).
 python -m venv .venv
 .venv/Scripts/python -m pip install torch==2.8.0 --index-url https://download.pytorch.org/whl/cu128   # GPU build
 .venv/Scripts/python -m pip install -e ".[dev]"                                                       # Windows
+.venv/Scripts/python -m pip install -e ".[dev,gliner]"                                                # + GLiNER models
 # Linux / macOS: .venv/bin/python instead of .venv/Scripts/python
 ```
 
-Torch is pinned to 2.8, the version the model was trained with. Install it before the editable
-install if you want a specific build. CPU works too, with `device: cpu` in the config.
+Torch is pinned to 2.8, the version the v5.0 model was trained with. Install it before the editable
+install if you want a specific build. CPU works too, with `ner.device: cpu` in the config.
 
 ### 2. Get the NER model
 
@@ -53,137 +56,226 @@ unzip ../token_classification_ft/outputs/release/xlmr-base-pii-ml-v5.0.zip -d mo
 ### 3. Run it
 
 ```bash
-python -m pii_pipeline.cli --config configs/pipeline.yaml --text "Hi Tan Wei Ming, account 123-456789-001"
-PII_CONFIG=configs/pipeline.yaml uvicorn pii_pipeline.api:app --host 127.0.0.1 --port 8000
+python -m pii_pipeline.cli --text "Hi Tan Wei Ming, account 123-456789-001"
+uvicorn pii_pipeline.api:app --host 127.0.0.1 --port 8000
 ```
+
+Both use the config shipped in the package (`src/pii_pipeline/config/detector_config.yaml`) unless
+you pass `--config` / set `PII_CONFIG`.
 
 ## How it works
 
-1. **Recognizers.** Four kinds feed Presidio's analyzer:
-   - the NER model (`HFTokenClassRecognizer`), the swap point
-   - deny lists and regex patterns (stock `PatternRecognizer`s)
-   - table recognizers, which label cells by their column or row headers
-   
-   Each recognizer is registered once per language. The copies share the loaded NER model.
-2. **Analysis.** `AnalyzerEngine` runs on `NoOpNlpEngine`, so no spaCy model is needed.
-   `allow_list` is applied by Presidio.
-3. **Checks gate.** Each detection is checked against the rules for its label. A rejected detection
-   is never masked and is reported in `rejected`. Deny-list values are not checked.
-4. **Overlap merging.** Overlapping spans are merged into one span covering their union. The label
-   comes from the best member, ordered by `priority`, then score, then length. Merging is
-   transitive. Spans that only touch are not merged. Nothing detected is left visible.
-5. **Masking.** Placeholders are assigned in text order, then Presidio's `AnonymizerEngine`
-   applies them. Presidio runs operators in reverse text order, so indexes are assigned up front.
-   The mode decides what counts as the same value. See [Masking modes](#masking-modes).
+**Detection** (`PIIPipeline.detect`):
+
+1. **Detectors.** Presidio's `AnalyzerEngine` runs every recognizer on the no-op NLP engine (no spaCy
+   model needed): deny lists, table and inline labels, regex patterns, Presidio built-ins, and the
+   NER model. Each is registered once per language; the copies share the loaded model. The allow
+   list is applied here.
+2. **Span rules.** Each detection must pass the rules for its label and the `"*"` rules. Deny-list
+   values are not checked. Refused detections are reported in `rejected`.
+3. **Context check.** A NER, regex or Presidio match that is a fragment of a longer ASCII word
+   ("Ann" in "Annual") is rejected as `context:inside_word`.
+4. **Structure overrides models.** Where a table cell or inline-label value overlaps a model span,
+   the structured label wins on the text it covers (`masking/semantic_values.py`).
+5. **Overlap merging.** Overlapping spans merge into their union. The label comes from the best
+   member by `priority`, then score, then length. Nothing detected is left visible.
+
+**Masking** (`PIIAnonymizer`):
+
+6. Spans whose values match under the label's variant rules share an identity.
+7. Other copies of values in `entities_to_look_out_for` are masked too; with `optimized: true`,
+   short forms of names as well.
+8. Neighbouring spans of one identity separated only by spaces merge into one.
+9. Tokens are assigned per identity (or per exact surface in versioned mode) and the text is built.
+   Labels with a `per_entity` operator are passed to Presidio's `AnonymizerEngine` instead.
 
 ## Configuration
 
-`configs/pipeline.yaml` has two parts, marked in the file:
+Two files in `src/pii_pipeline/config/`:
 
-- **TEMPLATE**: generic behaviour (`languages`, `default_language`, `allow_list`, `priority`,
-  `masking`). The same for every domain.
-- **DOMAIN**: what to detect (`ner`, `separator_insensitive`, `deny_list`, `tables`, `patterns`,
-  `checks`). To adapt the pipeline to another domain, replace this part.
+- **`detector_config.yaml`**: everything except regexes.
+- **`regex_patterns.yaml`**: your regex detectors, `{label, name, pattern, score?, context?}`. Ships
+  with commented examples only (email, SG NRIC, phone). It is found relative to the config file.
 
-| Key | Purpose |
+`detector_config.yaml` sections:
+
+| Section / key | Purpose |
 |---|---|
-| `ner.class` | `package.module:ClassName` of the NER recognizer. This is the swap point. |
-| `ner.params` | Passed to that class's constructor. For v5.0: `model_dir`, `device`, `max_length`, `stride`. |
-| `ner.label_map` | Renames model labels, e.g. `{BUSINESS: ORGANIZATION}`. Forwarded only when set. |
-| `ner.min_score` | Drops NER spans below this score. Forwarded only when set. |
-| `separator_insensitive` | Labels whose values match across separators (`123-456` = `123456`). Affects placeholder indexes only. |
-| `deny_list` | Exact values to mask, score 1.0. Case-insensitive unless `case_sensitive: true`. |
-| `tables` | Column and row header aliases, inline or via `fields_file`. See [Markdown tables](#markdown-tables). |
-| `patterns` | Regexes with a score. |
-| `checks` | Per-label rules a detection must pass to be masked. See [Checks](#checks). |
-| `allow_list` | Exact strings that are never masked. |
-| `priority` | Source order for choosing the label of a merged span: source, then score, then length. Must list `deny_list`, `table_columns`, `table_rows`, `patterns`, `ner`. |
-| `masking.mode` | `original` (default) or `versioned`. See [Masking modes](#masking-modes). |
-| `masking.format` | Placeholder template. See [Masking modes](#masking-modes). |
-| `masking.per_entity` | Overrides an entity with a Presidio operator, e.g. `{DOB: {operator: redact}}`. |
+| `languages`, `default_language` | Languages accepted per request. |
+| `regex_patterns_file` | Regex file, relative to the config. `regex_patterns:` can also list patterns inline. |
+| `presidio_recognizers.builtin` | Presidio predefined recognizers by class name, e.g. `[EmailRecognizer, IbanRecognizer]`. |
+| `presidio_recognizers.deny_list` | Exact values to mask, score 1.0. Case-insensitive unless `case_sensitive: true`. |
+| `anonymizer.mode`, `format`, `per_entity` | Placeholder mode and template; Presidio operators per label. See [Masking modes](#masking-modes). |
+| `anonymizer.priority` | Source order for labelling merged spans. Unlisted sources rank last. |
+| `anonymizer.allow_listed_values` | Optional. Exact strings that are never masked. |
+| `anonymizer.entities_to_look_out_for` | Labels whose values are masked wherever they repeat. |
+| `anonymizer.separator_insensitive` | Labels whose values ignore separators (`123-456` = `123456`). |
+| `anonymizer.span_variant_rules` | Per-label variant rules: `case`, `whitespace`, `separators`, `linebreaks`. |
+| `anonymizer.unmask_url` | `true` leaves spans that sit inside a URL unmasked. |
+| `anonymizer.included_entities` | Mask only these labels (`null` = all). |
+| `anonymizer.optimized` | Also mask short forms of detected names. |
+| `anonymizer.span_alias` | Inline labels: `{LABEL: [alias, ...]}` for `Alias: value` lines. |
+| `anonymizer.table_semantics` | Table columns and rows: `{name, entity_type, aliases}`. |
+| `anonymizer.span_rules` | Per-label rules a span must pass; `"*"` for all labels. |
+| `ner` | The model in use (`model: <name>`) and settings that override its entry: `device`, `window_size`, `stride`, `threshold`, `label_map`. |
+| `model` | Every available model: `token_classification`, `gliner`, `custom`. |
 
-A few constants still live in the NER port: `NUMERIC` in `recognizers/_bio.py` (labels that lose a
-trailing full stop) is set for the v5.0 labels. A different model with different labels should
-provide its own rule.
+Old top-level keys (`allow_list`, `masking`, `deny_list`, `patterns`, `tables`, `checks`, ...) are
+rejected with a message naming their new place.
 
 ## Masking modes
 
-Both modes give the same index to variants of one value. Variants differ in case and spacing, and
-in separators for labels listed in `separator_insensitive`. The modes differ in how placeholders
-map back to the text.
+Both modes give the same index to variants of one value (case, spacing, and the label's other
+variant rules). They differ in how placeholders map back to the text.
 
 | | `original` (default) | `versioned` |
 |---|---|---|
-| Placeholder | one per value: `[PERSON_01]` | one per exact text: `[PERSON_01.1]`, `[PERSON_01.2]` |
-| `Tan Wei Ming` and `tan wei ming` | both `[PERSON_01]` | `[PERSON_01.1]` and `[PERSON_01.2]` |
+| Placeholder | one per value: `[PERSON_01]` | one per exact text: `[PERSON_01_1]`, `[PERSON_01_2]` |
+| `Tan Wei Ming` and `tan wei ming` | both `[PERSON_01]` | `[PERSON_01_1]` and `[PERSON_01_2]` |
 | Mapping back | lossy: keeps the first variant only | 1:1: each placeholder maps to exactly one original |
 
-Formats:
+Default formats are `[{entity}_{index:02d}]` and `[{entity}_{index:02d}_{version}]`. A custom
+`format` must contain `{entity}` and `{index}`, plus `{version}` in versioned mode.
+`masking/tokens.py` builds, finds and parses tokens (`parse_token("[PERSON_01_2]") -> ("PERSON", 1, 2)`).
+Use `unmask(masked, mapping)` to restore text. Mappings contain PII; store them as you would the source.
 
-- `original`: `[{entity}_{index:02d}]`
-- `versioned`: `[{entity}_{index:02d}.{version}]`
+## Structured labels: tables and inline labels
 
-Versioned mode requires `{version}` in `masking.format`. Use `unmask(masked, mapping)` to restore
-the original text. Mappings contain PII, so store them as you would the source.
+Document structure says what a value is, which is more reliable than guessing from the value.
+Structured labels override model labels on the text they cover.
 
-## Markdown tables
-
-Tables are labelled from their headers, which is more reliable than guessing from the value.
-Define the aliases in the `tables` section of `configs/pipeline.yaml`, in two sections:
-
-```yaml
-tables:
-  column_headers:            # header-row cell -> labels every non-empty cell below it
-    ACCOUNT: [account no, acct]
-  row_headers:               # first cell of a row -> labels the other non-empty cells in that row
-    PERSON: [client name]
-```
-
-Or keep them in a separate file with `tables.fields_file`. Use one or the other, not both.
-
-- **Column mode:** in `| Account No | Note |`, the cells under "Account No" are ACCOUNT.
-- **Row mode:** in `| Client name | Tan Wei Ming |`, the cells to the right of "Client name" are PERSON.
-- Header and row-header cells are never masked.
-- Aliases match exactly after normalising case, spacing, and `*`, `_`, `` ` ``, `:` emphasis. Substrings don't match.
-- A cell is labelled as a whole. `Tax ID: S1234567D` in a labelled cell masks the whole cell.
-- Table labels outrank NER on the same text. Their score is `tables.score`.
-
-## Checks
-
-A check is a rule a detection must pass before it is masked. It is a function you write, in your own
-module. The template ships none. Enable them under `checks:`, one list per label:
+**Tables** (`table_semantics`):
 
 ```yaml
-checks:
-  DOB:
-    - {rule: "myrules.dates:dob_adult", years: 18}
+table_semantics:
+  columns:   # header-row cell -> labels every non-empty cell below it
+    - {name: account, entity_type: ACCOUNT, aliases: [account no, acct]}
+  rows:      # first cell of a row -> labels the other non-empty cells in that row
+    - {name: client, entity_type: PERSON, aliases: [client name]}
 ```
+
+- `| Account No | Note |`: the cells under "Account No" are ACCOUNT.
+- `| Client name | Tan Wei Ming |`: the cells to the right of "Client name" are PERSON.
+- Header and row-header cells are never masked. A cell is labelled as a whole.
+- A model span that crosses into a labelled cell is cut at the cell, so it never joins two cells.
+
+**Inline labels** (`span_alias`), outside tables:
+
+```
+Client name: Tan Wei Ming          colon
+- DOB: 1990-01-01                  bullet (-, *, +, •, 1.)
+**Phone:** +65 6123 4567           emphasis is ignored
+Name: Tan Wei Ming; DOB: 1990-01-01   several pairs on one line
+```
+
+A value runs to the end of the line, a `;` or `|`, or the next known label. Aliases match exactly
+after normalising case, spacing and `*` `_` `` ` `` `:` emphasis; substrings don't match.
+
+## Repeated values and name variants
+
+**Repeated values.** For labels in `entities_to_look_out_for`, once a value is detected every other
+copy in the document is masked with the same identity, in any format its variant rules accept:
+`TAN WEI MING` for `Tan Wei Ming`, `123 456` for `123-456` (separator-insensitive labels), and
+e-mail addresses split across lines (`john.doe@exam⏎ple.com`). Copies inside a longer word and
+allow-listed values are skipped. These spans have source `propagated`.
+
+**Name variants** (`optimized: true`). For each detected name (`name_entities`, default `[PERSON]`)
+the anonymizer also masks `Wei Ming`, `Tan`, `Mr Tan`, `W. M. Tan` and similar forms, with the full
+name's identity. To avoid tagging a different person:
+
+- a form shared by two detected names is skipped (`Tan` when both `Tan Wei Ming` and `Tan Ah Kow` are found)
+- a form next to a capitalised word that is not part of the name is skipped (`Tan` in `Tan Ah Kow`);
+  titles and sentence-initial words don't count
+- forms are matched case-sensitively, as whole words, longest first
+
+These spans have source `name_variant`.
+
+## Span rules
+
+A span rule is a check a detection must pass before it is masked: `fn(text, params, today) -> bool`,
+`True` keeps the span.
+
+```yaml
+span_rules:
+  "*":  [{rule: min_length, chars: 2}]           # every label
+  DOB:  [{rule: dob_adult, years: 18}]            # built-in rule
+  TIN:  [{rule: "myrules.ids:valid_nric"}]        # your own function
+```
+
+Built-in rules (`masking/span_rules.py`): `min_length`, `max_length`, `has_digit`, `has_letter`,
+`matches` (regex), `not_in` (values), `dob_adult`, `not_future`. Date rules read ISO and day-first
+dates and keep values they cannot parse.
+
+- A span is masked only if every rule for its label and every `"*"` rule returns `True`.
+- Rules are resolved when the config loads, so a bad name fails there.
+- A rejected detection is reported in `rejected` with its rule name and no text.
+- Deny-list values are not checked. Rules run before merging, so a rejected span never masks text.
+
+## NER models: BIO and GLiNER
+
+Models are listed under `model` and chosen with `ner.model`:
+
+```yaml
+ner:
+  model: gliner_multi_pii      # switch models by name
+  device: auto
+model:
+  token_classification:        # Hugging Face BIO token classification
+    xlmr_v5: {model_dir: models/xlmr-base-pii-ml-v5.0, window_size: 384, stride: 96}
+  gliner:                      # GLiNER, needs `pip install .[gliner]`
+    gliner_multi_pii:
+      model: urchade/gliner_multi_pii-v1
+      threshold: 0.5
+      labels: {person: PERSON, "phone number": PHONE}
+  custom:                      # any Presidio EntityRecognizer
+    mine: {class: "my_pkg.rec:MyRecognizer", params: {}}
+```
+
+- **BIO** (`recognizers/ner_hf.py`): sliding windows (`window_size` in tokens), max-confidence merge,
+  visible line breaks, script word boundaries and punctuation trim, as in the v5.0 release.
+  `tests/test_ner_v5.py` checks parity with the sibling `PIIPredictor`.
+- **GLiNER** (`recognizers/gliner.py`): `labels` maps GLiNER's prompt labels to entity types (a
+  plain list uses the upper-cased label). Long text is cut into overlapping character windows
+  (`window_size` in characters, `stride`), preferably at whitespace. If the `gliner` package is
+  missing, loading fails with a message saying how to install it.
+- **Custom**: a Presidio `EntityRecognizer` whose constructor takes `params`. An inline
+  `ner: {class: ..., params: ...}` also works without a `model` entry.
+
+`ner` settings override the same keys in the chosen entry, so `threshold` or `window_size` set there
+apply to whichever model is in use.
+
+## Python API
 
 ```python
-# myrules/dates.py
-from datetime import date
+from pii_pipeline import PIIPipeline, DetectionRequest
 
-def dob_adult(text, params, today):
-    """Return True to keep (mask) the span, False to reject it."""
-    ...
+pipeline = PIIPipeline.from_yaml()                # packaged config, or a path
+found = pipeline.detect(DetectionRequest(text, context={"language": "en"}))
+result = pipeline.mask(text, return_mapping=True)  # result.text, result.entities, result.mapping
 ```
 
-- The rule gets the span text, its params from config, and the reference date.
-- A span is masked only if every rule for its label returns `True`.
-- Rules are checked when the config loads. A bad path fails there, not during masking.
-- A rejected detection is reported in `rejected` with its rule name and no text.
-- Deny-list values are not checked.
-- Rules run before merging, so a rejected span never masks text.
+`detect` returns a `DetectionResult` (text, sha256 checksum, `PIISpan`s, `rejected`). To keep
+tokens consistent across documents, reuse one anonymizer:
 
-Rules decide their own edge cases. A common choice is to return `True` when a value can't be
-parsed, so that such values are still masked.
+```python
+anon = pipeline.new_anonymizer()
+anon.load_mappings({"Tan Wei Ming": "[PERSON_07]"})   # optional: user-chosen tokens
+for doc in docs:
+    masked = pipeline.mask(doc, anonymizer=anon).text
+anon.mappings()            # surface -> token for everything seen
+anon.mappings(doc)         # only surfaces that occur in doc
+```
+
+`anon.resolve(result, text)` assigns tokens without building text; `anonymize` refuses a result
+whose checksum doesn't match the text. Errors are `PIIError` subclasses in `core/errors.py`, each
+with a `code` and HTTP status.
 
 ## Command line
 
 ```bash
-python -m pii_pipeline.cli --config configs/pipeline.yaml --text "..."
-python -m pii_pipeline.cli --config configs/pipeline.yaml --file doc.txt --json
-python -m pii_pipeline.cli --config configs/pipeline.yaml --file doc.txt --json --mapping   # mapping contains PII
+python -m pii_pipeline.cli --text "..."
+python -m pii_pipeline.cli --config my_config.yaml --file doc.txt --json
+python -m pii_pipeline.cli --file doc.txt --json --mapping   # mapping contains PII
 ```
 
 `--json` prints `text`, `entities`, and `rejected`. `--mapping` adds `mapping`.
@@ -191,12 +283,12 @@ python -m pii_pipeline.cli --config configs/pipeline.yaml --file doc.txt --json 
 ## HTTP API
 
 ```bash
-PII_CONFIG=configs/pipeline.yaml uvicorn pii_pipeline.api:app --host 127.0.0.1 --port 8000
+uvicorn pii_pipeline.api:app --host 127.0.0.1 --port 8000
 ```
 
 | Method | Path | Purpose |
 |---|---|---|
-| `GET` | `/health` | Status, languages, NER class, check count, masking mode |
+| `GET` | `/health` | Status, languages, NER model, span-rule count, masking mode |
 | `POST` | `/analyze` | Detect spans. Nothing is masked. |
 | `POST` | `/mask` | Detect and mask. Optional `return_mapping`. |
 
@@ -207,7 +299,8 @@ The API has no authentication. Run it on a private network or behind a gateway.
 
 ### Docker
 
-The image runs the API on CPU and does not contain the model weights. Mount `models/` at runtime:
+The image runs the API on CPU with the packaged config and does not contain the model weights.
+Mount `models/` at runtime:
 
 ```bash
 docker build -t pii-mask-pipeline .
@@ -218,42 +311,33 @@ On Windows with Git Bash, prefix the run command with `MSYS_NO_PATHCONV=1`. Othe
 rewrites the container path in `-v` and the mount is missing.
 
 The container runs as a non-root user and reports health at `/health`. It uses one worker, because
-each worker loads its own copy of the model. Pass a different config with `-e PII_CONFIG=/app/configs/<file>`
-after copying the file into the image, or by mounting it over `/app/configs`.
-
-## Swapping the NER model
-
-- **Different weights, same architecture:** change `ner.params.model_dir`.
-- **Different implementation:** write a Presidio `EntityRecognizer` whose `analyze()` returns
-  `RecognizerResult`s, then set `ner.class` to it. Its constructor receives `ner.params`.
-
-The HF token-classification port (`recognizers/_bio.py`, `recognizers/ner_hf.py`) covers the
-sliding windows, max-confidence merge, visible line breaks, script word boundaries, and punctuation
-trim that the v5.0 release uses. The repo does not import the sibling project.
-`tests/test_ner_v5.py` checks that spans match the sibling `PIIPredictor` on sample documents.
+each worker loads its own copy of the model. To use another config, mount it and pass
+`-e PII_CONFIG=/path/in/container/detector_config.yaml`.
 
 ## Tests
 
 ```bash
-.venv/Scripts/python -m pytest                               # everything
-.venv/Scripts/python -m pytest tests/test_pipeline_rules.py  # no model needed
+.venv/Scripts/python -m pytest                        # everything
+.venv/Scripts/python -m pytest tests/test_anonymizer.py   # no model needed
 ```
 
 Model-based tests skip when `models/` is missing. Most of the suite uses a fake NER
-(`tests/fake_ner.py`) and runs in seconds.
+(`tests/fake_ner.py`) or a fake `gliner` module and runs in seconds.
 
 ## Known limitations
 
-- **Patterns have no context words.** With the no-op NLP engine, Presidio has no tokens to match
-  context against, so context-dependent scoring is not available.
 - **Merging can over-mask.** A NER span that overlaps a span of another type takes that span's label,
-  and the union is masked as one placeholder. For example, a PERSON span touching an ADDRESS span
-  becomes one ADDRESS placeholder. A deny-list value at the start of a longer span can also pull in
-  trailing punctuation the NER span included.
+  and the union is masked as one placeholder. Structured labels are the exception: they cut model
+  spans instead of merging with them.
+- **Inline values run to the end of the line** unless a `;`, `|` or another known label ends them.
+  Keep `span_alias` to labels that introduce a single value.
+- **Name variants are for space-separated names.** Names written without spaces (Chinese, Japanese)
+  get no short forms. The neighbour guard is a heuristic: a capitalised word after a short form
+  blocks it, so `Tan Singapore` is left alone and a lowercase surname is never matched.
+- **Repeated-value masking is document-wide.** A short detected value (e.g. a two-letter name) in
+  `entities_to_look_out_for` is masked at every whole-word occurrence.
 - **Case-insensitive placeholders in original mode.** `Jane Doe` and `jane doe` share `[PERSON_01]`,
   and the mapping keeps the first original seen. Versioned mode keeps them apart.
-- **Versioned placeholders need `{version}` in the format.** Configs that set a custom format without
-  it fail to load.
 - **Masking mode is set in config only.** Requests cannot choose a mode per call.
 - **Single-process server.** One document per request, no batching, no authentication or rate
   limiting.
@@ -261,23 +345,35 @@ Model-based tests skip when `models/` is missing. Most of the suite uses a fake 
 ## Project layout
 
 ```
-configs/pipeline.yaml        template + domain configuration
-docs/API.md                  HTTP API reference
-models/                      NER weights (not in repo)
+docs/API.md                    HTTP API reference
+models/                        NER weights (not in repo)
 src/pii_pipeline/
-  api.py                     FastAPI app: /health, /analyze, /mask
-  cli.py                     command line
-  config.py                  YAML -> validated configuration
-  analyzer.py                Presidio analyzer assembly, merge_overlaps
-  pipeline.py                PIIPipeline: detect, mask
-  masking.py                 placeholder assignment, modes, unmask
-  checks.py                  user-rule loading and the gate
-  tables.py                  markdown table parsing, header aliases
-  registry.py                'module:Class' loader (swap point)
+  api.py                       FastAPI app: /health, /analyze, /mask
+  cli.py                       command line
+  pipeline.py                  PIIPipeline: detect, mask
+  analyzer.py                  Presidio analyzer assembly, NER loading, merge_overlaps
+  registry.py                  'module:Class' loader
+  config/
+    detector_config.py         YAML -> validated DetectorConfig
+    detector_config.yaml       default configuration
+    regex_patterns.yaml        regex detectors (examples)
+  core/
+    types.py                   DetectionRequest, PIISpan, DetectionResult
+    errors.py                  PIIError and subclasses, with codes and HTTP statuses
+  masking/
+    anonymizer.py              PIIAnonymizer: identities, tokens, propagation, unmask
+    optimized_anonymizer.py    OptimizedAnonymizer: name variants with neighbour guard
+    tokens.py                  placeholder format, parse, validate
+    span_variants.py           variant rules: case, whitespace, separators, line breaks
+    span_rules.py              built-in rules and the rule gate
+    structured_rules.py        markdown tables and inline 'Label: value' parsing
+    semantic_values.py         structured labels override model spans
+  nlp/
+    context_enhancer.py        word-fragment check, label-in-window checks
   recognizers/
-    ner_hf.py                HF token-classification recognizer (v5.0 port)
-    _bio.py                  BIO / window helpers for the NER port
-    deterministic.py         deny-list and pattern recognizers
-    table.py                 table-field recognizer
-tests/                       pytest suite
+    ner_hf.py, _bio.py         BIO token-classification recognizer (v5.0 port)
+    gliner.py                  GLiNER adapter
+    deterministic.py           deny-list, regex (with context words), Presidio built-ins
+    table.py                   structured-label recognizer (tables, inline labels)
+tests/                         pytest suite
 ```

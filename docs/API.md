@@ -9,12 +9,12 @@ The OpenAPI schema is at `/openapi.json`.
 ## Running
 
 ```bash
-PII_CONFIG=configs/pipeline.yaml uvicorn pii_pipeline.api:app --host 127.0.0.1 --port 8000
+uvicorn pii_pipeline.api:app --host 127.0.0.1 --port 8000
 ```
 
 | Environment variable | Default | Meaning |
 |---|---|---|
-| `PII_CONFIG` | `configs/pipeline.yaml` | Pipeline configuration. Read once at startup. |
+| `PII_CONFIG` | packaged `detector_config.yaml` | Detector configuration. Read once at startup. |
 | `PII_MAX_TEXT_CHARS` | `200000` | Largest accepted `text`, in characters. Larger requests get `413`. |
 
 The model loads once, when the server starts. A bad config or a missing model stops startup,
@@ -35,7 +35,7 @@ so the server never answers with a half-loaded pipeline.
   "status": "ok",
   "languages": ["en", "zh", "ja", "ko", "hi", "ar", "th", "vi", "ms", "id", "tl"],
   "default_language": "en",
-  "ner": "pii_pipeline.recognizers.ner_hf:HFTokenClassRecognizer",
+  "ner": "xlmr_v5",
   "checks": 0,
   "masking_mode": "original"
 }
@@ -46,8 +46,8 @@ so the server never answers with a half-loaded pipeline.
 | `status` | Always `ok` while the server is up. |
 | `languages` | Languages accepted in `language`. |
 | `default_language` | Used when a request omits `language`. |
-| `ner` | Class path of the configured NER recognizer, or `null` if none. |
-| `checks` | Number of configured check rules. |
+| `ner` | Name of the configured NER model (`ner.model`), its class path for an inline `ner.class`, or `null` if none. |
+| `checks` | Number of configured span rules (`anonymizer.span_rules`). |
 | `masking_mode` | `original` or `versioned`. See [Masking modes](#masking-modes). |
 
 ### `POST /analyze`
@@ -133,47 +133,50 @@ Unknown fields are ignored.
 | `entity_type` | string | Label, e.g. `PERSON`, `ACCOUNT`, `DOB`. After any `label_map` renaming. |
 | `start`, `end` | integer | Character offsets of the span. `end` is exclusive. |
 | `score` | number | Confidence, rounded to 4 decimal places. Deny-list matches are `1.0`. |
-| `source` | string | Which recognizer produced the span: `deny_list`, `table_columns`, `table_rows`, `patterns`, or `ner`. |
+| `source` | string | Which detector produced the span: `deny_list`, `table_columns`, `table_rows`, `inline_labels`, `patterns`, `presidio`, or `ner`. Spans the anonymizer added are `propagated` (another copy of a detected value) or `name_variant` (a short form of a detected name). |
 | `placeholder` | string | `/mask` only. The replacement text. |
 
 Entities are sorted by `start`. Overlapping detections are merged into one entity, so no two
-entities overlap.
+entities overlap. `/mask` can list more entities than `/analyze` for the same text: it also
+masks other copies of values in `entities_to_look_out_for` and, with `optimized: true`, short forms
+of names. `/analyze` lists only what the detectors found.
 
 ### Rejected
 
-A detection that a check rule refused. It was not masked and does not appear in `entities`.
+A detection that a span rule or the context check refused. It was not masked and does not appear in `entities`.
 
 | Field | Type | Meaning |
 |---|---|---|
 | `entity_type` | string | Label the detection had. |
 | `start`, `end` | integer | Offsets of the refused span. |
 | `source` | string | Recognizer that produced it. |
-| `rule` | string | The `package.module:function` rule that refused it. |
+| `rule` | string | The rule that refused it: a built-in name, a `package.module:function` path, or `context:inside_word` for a match inside a longer word. |
 
 Rejected entries contain no matched text. Deny-list values are never rejected.
 
 ## Masking modes
 
-Set by `masking.mode` in the configuration. The API does not choose a mode per request.
+Set by `anonymizer.mode` in the configuration. The API does not choose a mode per request.
 
 | Mode | Placeholder | Mapping back |
 |---|---|---|
 | `original` (default) | one per value: `[PERSON_01]` | Lossy. Variants such as `Tan Wei Ming` and `tan wei ming` share one placeholder, and the mapping keeps only the first. |
-| `versioned` | one per exact text: `[PERSON_01.1]`, `[PERSON_01.2]` | 1:1. Every placeholder maps to exactly one original string. |
+| `versioned` | one per exact text: `[PERSON_01_1]`, `[PERSON_01_2]` | 1:1. Every placeholder maps to exactly one original string. |
 
 In versioned mode, a response from `/mask` with `return_mapping: true` can be reversed exactly
 by replacing each placeholder with its mapping value.
 
 ## Errors
 
-Errors use FastAPI's standard body: `{"detail": ...}`.
+Pipeline errors return `{"detail": "<message>", "code": "<code>"}`. Request validation errors use
+FastAPI's standard `{"detail": [...]}` body.
 
-| Status | When | Example `detail` |
-|---|---|---|
-| `413` | `text` is longer than `PII_MAX_TEXT_CHARS` | `"text is 250000 characters; limit is 200000"` |
-| `422` | `language` is not configured | `"language 'fr' is not configured; available: ['en', ...]"` |
-| `422` | Request body is malformed or a required field is missing | Pydantic's validation list |
-| `500` | Unexpected server error | The request text is not included in logs or responses |
+| Status | `code` | When | Example `detail` |
+|---|---|---|---|
+| `413` | `text_too_large` | `text` is longer than `PII_MAX_TEXT_CHARS` | `"text is 250000 characters; limit is 200000"` |
+| `422` | `unsupported_language` | `language` is not configured | `"language 'fr' is not configured; available: ['en', ...]"` |
+| `422` | | Request body is malformed or a required field is missing | Pydantic's validation list |
+| `500` | | Unexpected server error | The request text is not included in logs or responses |
 
 ## Offsets
 
@@ -239,5 +242,5 @@ in a single pass.
 
 ## Versioning
 
-The API is `version: 0.1.0`. Field additions are backward compatible. Removing or renaming a field
+The API is `version: 0.2.0`. 0.2.0 changed the versioned placeholder from `[PERSON_01.2]` to `[PERSON_01_2]` and added `code` to error bodies. Field additions are backward compatible. Removing or renaming a field
 is a breaking change, and will bump the major version.

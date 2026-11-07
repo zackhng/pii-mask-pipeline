@@ -3,24 +3,25 @@ import pytest
 from presidio_analyzer import RecognizerResult
 
 from pii_pipeline.analyzer import merge_overlaps
-from pii_pipeline.config import NerConfig, parse_config
-from pii_pipeline.masking import assign_placeholders, normalise
+from pii_pipeline.config import AnonymizerConfig, NerConfig, parse_config
+from pii_pipeline.core.types import DetectionResult, PIISpan, checksum_of
+from pii_pipeline.masking.anonymizer import PIIAnonymizer
+from pii_pipeline.masking.span_variants import normalise
 from pii_pipeline.pipeline import PIIPipeline
 
 
 def make_pipeline(phrases=None, deny=None, patterns=None, allow=None, priority=None, masking=None,
                   separator_insensitive=None):
+    anonymizer = {"allow_listed_values": allow or [], "separator_insensitive": separator_insensitive or [],
+                  **(masking or {})}
+    if priority:
+        anonymizer["priority"] = priority
     raw = {
         "languages": ["en"],
-        "deny_list": deny or [],
-        "patterns": patterns or [],
-        "allow_list": allow or [],
-        "separator_insensitive": separator_insensitive or [],
+        "presidio_recognizers": {"deny_list": deny or []},
+        "regex_patterns": patterns or [],
+        "anonymizer": anonymizer,
     }
-    if priority:
-        raw["priority"] = priority
-    if masking:
-        raw["masking"] = masking
     cfg = parse_config(raw)
     if phrases is not None:
         cfg.ner = NerConfig(class_path="fake_ner:FakeNER", params={"phrases": phrases})
@@ -52,7 +53,7 @@ def test_case_sensitive_deny_list_respects_case():
 
 
 def test_regex_pattern():
-    p = make_pipeline(patterns=[{"name": "nric", "entity": "TIN", "regex": r"\b[STFG]\d{7}[A-Z]\b", "score": 0.85}])
+    p = make_pipeline(patterns=[{"name": "nric", "label": "TIN", "pattern": r"\b[STFG]\d{7}[A-Z]\b", "score": 0.85}])
     assert p.mask("NRIC S1234567D on file").text == "NRIC [TIN_01] on file"
 
 
@@ -129,11 +130,12 @@ def test_deny_list_inside_ner_span_no_longer_leaks_remainder():
     assert p.mask("Acme Wealth Pte Ltd is here").text == "[BUSINESS_01] is here"
 
 
-def test_assign_placeholders_and_normalise():
-    from pii_pipeline.config import MaskingConfig
-    text = "bob BOB  Bob"
-    results = [RecognizerResult("PERSON", s, s + 3, 1.0) for s in (0, 4, 9)]
-    assert assign_placeholders(text, results, MaskingConfig()) == ["[PERSON_01]"] * 3
+def test_variants_share_a_placeholder_and_normalise():
+    text = "bob, BOB, Bob"
+    spans = [PIISpan(s, s + 3, text[s:s + 3], "PERSON", 1.0, "ner:X") for s in (0, 5, 10)]
+    result = DetectionResult(text, checksum_of(text), spans)
+    resolved = PIIAnonymizer(config=AnonymizerConfig()).resolve(result, text)
+    assert [s.token for s in resolved] == ["[PERSON_01]"] * 3
     assert normalise("12-3 4", "ACCOUNT", frozenset({"ACCOUNT"})) == "1234"
     assert normalise("12-3 4", "ADDRESS", frozenset({"ACCOUNT"})) == "12-3 4"
     assert normalise("12-3 4", "ACCOUNT") == "12-3 4"   # not separator-insensitive unless configured
@@ -141,8 +143,22 @@ def test_assign_placeholders_and_normalise():
 
 def test_config_rejects_bad_priority_and_format():
     with pytest.raises(ValueError, match="priority"):
-        parse_config({"priority": ["ner", "deny_list"]})
-    with pytest.raises(ValueError, match="masking.format"):
-        parse_config({"masking": {"format": "[PII]"}})
+        parse_config({"anonymizer": {"priority": ["ner", "spacy"]}})
+    with pytest.raises(ValueError, match="priority"):
+        parse_config({"anonymizer": {"priority": ["ner", "ner"]}})
+    with pytest.raises(ValueError, match="anonymizer.format"):
+        parse_config({"anonymizer": {"format": "[PII]"}})
     with pytest.raises(ValueError, match="score"):
-        parse_config({"patterns": [{"name": "x", "entity": "TIN", "regex": "a", "score": 1.5}]})
+        parse_config({"regex_patterns": [{"name": "x", "label": "TIN", "pattern": "a", "score": 1.5}]})
+
+
+def test_partial_priority_ranks_unlisted_sources_last():
+    cfg = parse_config({"anonymizer": {"priority": ["ner", "deny_list"]}})
+    assert cfg.anonymizer.priority[:2] == ["ner", "deny_list"] and len(cfg.anonymizer.priority) == 7
+
+
+def test_old_top_level_keys_point_to_their_new_place():
+    with pytest.raises(ValueError, match="anonymizer.span_rules"):
+        parse_config({"checks": {}})
+    with pytest.raises(ValueError, match="presidio_recognizers.deny_list"):
+        parse_config({"deny_list": []})
